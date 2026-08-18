@@ -68,12 +68,36 @@ METHOD AND THE TRICKS USED, WITH CITATIONS
 
 [2] Bin-pair majorant table.  The majorant is not a single global
     number but a matrix fmaj[b,c] over pairs of mass bins, built once
-    from the bin upper corners.  This keeps the acceptance ratio O(1)
-    in every bin pair even when the mass range spans many decades, and
-    -- crucially -- keeps the m^lambda scaling of the kernel inside the
-    clock.  A single running global f_max instead tracks the extreme of
-    the mass distribution, collapses the acceptance, and silently
-    removes the kernel dependence from dt.
+    from the bin upper corners.  What that buys is COST and a CHECKABLE
+    BOUND -- not correctness, because the majorant cancels out of the
+    physical rate exactly:
+
+        (w R / 2V) * (fmaj_ij / R) * (K_ij / fmaj_ij)  =  w K_ij / (2V),
+
+    i.e. ticks per unit time, times the chance the tick picked that pair,
+    times the acceptance.  fmaj cancels twice, once in the selection
+    weight and once in the acceptance, and summing over unordered pairs
+    returns the Smoluchowski rate.  ANY valid majorant gives the same
+    physics; a bad one only wastes trials.  This holds because the clock
+    is advanced on every TRIAL, not on every event -- see note [5iv].
+
+    A single global f_max = K(m_max,m_max) is therefore legitimate and
+    unbiased.  It is still the wrong choice, for three reasons:
+      - acceptance.  A typical pair is accepted with probability
+        <K>/f_max ~ (m0/m_max)^lambda, i.e. 10^(-lambda D) across D
+        decades: for the geometric kernel over four decades that is
+        2e-3, some five hundred trials per event against 1.05 with the
+        table, whose corner overshoot is only 10^(0.1 lambda) per
+        argument at 0.1-dex bins.
+      - the stall guard misfires.  max_stall_tries counts trials without
+        an accepted event; at an acceptance of 2e-3 its default 2e6 is
+        only ~4000 events of honest work, so a healthy run dies with the
+        diagnosis "acceptance collapsed".
+      - a LAGGING maximum is a genuine bias.  A running global maximum
+        not refreshed before some particle grows past it gives fmaj < K,
+        and the thinning is then silently wrong.  The corner table is
+        static and every trial checks K <= fmaj explicitly, so the same
+        situation raises instead of biasing.
       - Eibeck & Wagner, SIAM J. Sci. Comput. 22, 802 (2000)
         doi:10.1137/S1064827599353488           [binned / efficient version]
 
@@ -117,6 +141,24 @@ METHOD AND THE TRICKS USED, WITH CITATIONS
     (iii) dt must be QUADRATIC in the particle number, because the
           process is binary.  A step linear in N describes a unary
           process and gives the wrong N(t).
+
+    (iv) TIME ADVANCES ON EVERY TRIAL, not on every event.  t_phys is
+         incremented right after dt is formed, some fifty lines before
+         the acceptance test, so null (thinned) trials move the clock
+         too.  That is exactly what makes the cancellation in note [2]
+         work, and moving the increment inside the accepted branch is
+         the one edit that turns the majorant from a cost into a BIAS:
+         time would then advance by 2V/(wR) per accepted event, the
+         reported rate would be R instead of R*<K/fmaj> = sum K, and
+         with a global f_max one would get dt_eff ~ 1/(N^2 m_max^lambda)
+         -- the kernel entering through the EXTREME of the distribution
+         instead of through the typical mass.  In an open system m_max
+         is pinned at the sink and does not grow, so the m0 dependence
+         leaves the clock entirely, the drift degenerates to
+         dm0/dt ~ m0 (exponential, beta = 1), and the constant-flux
+         argument then returns alpha = -2 for EVERY kernel.  That is a
+         third, purely numerical route to the same -2 fingerprint that
+         note [8] produces physically.
 
 [6] Deterministic (residual) injection.
     Injection uses a fractional accumulator rather than a Poisson draw,
