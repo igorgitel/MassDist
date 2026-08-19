@@ -1,44 +1,6 @@
 """
 BF_v_no_resampling_v2.py  --  Majorant_v2
 
-*** BASELINE VARIANT: NO RESAMPLING, NO THINNING. ***
-One simulated particle is one physical particle, w == 1 for the whole run.
-Everything else -- majorant, clock, snapshot modes, analysis helpers --
-is identical to BF.py, so the two can be compared line for line.
-
-----------------------------------------------------------------------
-WHAT v2 CHANGES RELATIVE TO BF_v_no_resampling.py
-----------------------------------------------------------------------
-The physics, the majorant, the clock and every analysis helper are
-untouched.  Four additions, all about the SINK as a criterion:
-
-  1. `iso_start_sink` now defaults to 10 instead of 0, and it applies to
-     COAGULATION and FRAGMENTATION alike.  The sink is the sink, whichever
-     end of the cascade it sits at: for coagulation it absorbs products
-     above m_sink, for fragmentation it absorbs fragments below it.  The
-     gate says "do not bin a single age until the cascade has demonstrably
-     pushed 10 physical particles all the way across the inertial range",
-     which is the one steady-state statement that does NOT have to be
-     retuned when N_ss or the mass range changes.
-
-  2. A CLOSED system has no sink, so the default gate is silently disarmed
-     there.  Only an explicitly passed value still raises.  Without this,
-     arming the default would break every closed run on an argument the
-     caller never typed.  The `_Default` int subclass makes the difference
-     visible to the validator and invisible to everything else.
-
-  3. `stop_sink_events` (new, default None): stop the run once this many
-     physical particles have left through the sink.  `max_events` is a
-     statement about RESOURCES; this one is a statement about the PHYSICS.
-
-  4. `out["n_out"]` (new): the sink counter as a per-snapshot time series,
-     alongside the existing final scalar `out["sink_events"]`.  Deliberately
-     a different name -- see the comment at the `rows` dict.
-
-Everything a v1 script did still runs unchanged, with one intended
-difference: an open run that requests isochrones now waits for 10 sink
-absorptions before accumulating, instead of starting immediately.
-======================================================================
 ONE event-driven Monte Carlo engine for the mass-space cascade, covering
 all four configurations with the same code path:
 
@@ -50,6 +12,12 @@ The physics that differs between the four cases enters only through
 (b) the boundary conditions (injection + absorbing sink, or none).
 Everything else -- majorant construction, pair selection, the clock,
 the bookkeeping -- is shared.
+
+BASELINE VARIANT: NO RESAMPLING, NO THINNING.  One simulated particle is
+one physical particle, w == 1 for the whole run, so Sum(w) and Sum(w*m)
+are conserved to machine precision and `mass_drift` is identically zero.
+That is what *conservative* means in the names of the runs this engine
+writes.  What it costs is range -- see note [9].
 
 ----------------------------------------------------------------------
 METHOD AND THE TRICKS USED, WITH CITATIONS
@@ -98,8 +66,10 @@ METHOD AND THE TRICKS USED, WITH CITATIONS
         and the thinning is then silently wrong.  The corner table is
         static and every trial checks K <= fmaj explicitly, so the same
         situation raises instead of biasing.
+
+    For the binned / efficient version of this construction see
       - Eibeck & Wagner, SIAM J. Sci. Comput. 22, 802 (2000)
-        doi:10.1137/S1064827599353488           [binned / efficient version]
+        doi:10.1137/S1064827599353488
 
 [3] O(1) bin membership with swap-with-last.
     bins[b] is a python list of particle indices; pos_in_bin[i] is the
@@ -133,10 +103,11 @@ METHOD AND THE TRICKS USED, WITH CITATIONS
          simulated particle is one physical particle.  It is still
          written into the step,
                        dt = 2 * V / (w * R),
-         so that the formula matches BF.py exactly and a constant w != 1
-         simply rescales the density.  Nothing in this file ever changes
-         w, so the clock cannot be corrupted by weight bookkeeping --
-         which is the whole reason this baseline exists.
+         so that a constant w != 1 simply rescales the density and the
+         formula stays identical to the weighted variant of this engine.
+         Nothing in this file ever changes w, so the clock cannot be
+         corrupted by weight bookkeeping -- which is the whole reason
+         this baseline exists.
 
     (iii) dt must be QUADRATIC in the particle number, because the
           process is binary.  A step linear in N describes a unary
@@ -166,12 +137,51 @@ METHOD AND THE TRICKS USED, WITH CITATIONS
     modelling choice and is stated in the output metadata.
 
 [7] Isochrone (age) bookkeeping.
-    Every particle carries its injection time.  For FRAGMENTATION the
-    age of a fragment is unambiguous: fragments are the descendants of
-    exactly one parent.  For COAGULATION a merged particle has TWO
-    ancestors and an inheritance rule must be chosen; it is exposed as
-    a parameter (`age_rule`) precisely because the isochrone analysis
-    depends on it and the choice must be reported and tested.
+
+    Every particle carries `inj_time`, the moment its own clock was last
+    set; the histogram bins tau = t_phys - inj_time.  Accumulation does
+    not begin until the sink has swallowed `iso_start_sink` physical
+    particles (default 10) -- the one steady-state statement that needs
+    no retuning when N_ss, the kernel or the mass range changes.  A
+    CLOSED system has no sink, so the default gate is silently disarmed
+    there; only an explicitly passed value still raises.
+
+    What tau MEANS depends on when clocks may be reset, and the two
+    processes are not symmetric.
+
+    COAGULATION.  A merged particle has two ancestors, so an inheritance
+    rule is needed: `age_rule` ('min'|'max'|'mass_weighted'|'heavier').
+    Clocks are set at injection only, always on a particle of mass
+    m_inj, so every tracer starts from the same mass and <m>(tau) is
+    well posed.  Report the rule and test its sensitivity -- 'min' and
+    'heavier' weight the tail of the merger tree differently.
+
+    FRAGMENTATION.  A fragment has one parent, so nothing is ambiguous
+    -- but that is not the same as nothing being chosen, and the first
+    version of this engine mistook the one for the other.  With both
+    fragments keeping the parent's stamp, no clock is ever reset and an
+    "age class" is the whole descendant tree of one injected body: a
+    FAMILY, spanning the full inertial range by construction, however
+    long the run.  Not an isochrone.  (Diagnostic: under 'inherit' the
+    median age equals the maximum age, because essentially every live
+    particle descends from t = 0.)
+
+    `frag_age_rule` picks which piece keeps the clock:
+        'inherit'   both do -- the old behaviour, kept as the null case.
+        'heavier'   heavier keeps it, lighter is reborn at t_phys.  The
+                    tracer is then the always-heavy chain: a
+                    characteristic of the transport equation, i.e. the
+                    FRONT.  The physical choice.
+        'lighter'   mirror image; a sensitivity test, not physics.
+        'both_new'  both reborn; kills the age axis on purpose, so a
+                    surviving <m>(tau) trend is a bug.
+
+    The rule is diagnostic only: it touches no mass and consumes no
+    random numbers.  Same seed, different rule => identical `live`,
+    `M_sys`, `sink_events`.  If not, it has leaked into the dynamics.
+
+    Note that alpha does not depend on this rule at all and b depends on
+    it entirely -- see the closing paragraph of the predictions below.
 
 [8] LOCALITY OF THE FRAGMENTATION RULE  --  a physics trap, not a bug.
 
@@ -199,6 +209,12 @@ METHOD AND THE TRICKS USED, WITH CITATIONS
     by construction.  This is why the closed runs agree with the theory
     even at f = 0, and the open ones do not.
 
+    This note and note [7] are DIFFERENT diseases and must not be
+    conflated: f is about which collisions are allowed to break a body,
+    frag_age_rule is about which piece keeps the clock afterwards.  f
+    changes the dynamics and moves alpha; the age rule changes nothing
+    but the label on a particle and moves only b.
+
 [9] NO RESAMPLING, NO THINNING  --  and what that costs.
 
     This variant deliberately omits the weight machinery.  Every
@@ -223,13 +239,25 @@ METHOD AND THE TRICKS USED, WITH CITATIONS
         thousandfold and memory, not physics, ends the run.
 
     Use this file when the priority is an unimpeachable baseline: exact
-    conservation, no weights, no schemes to defend.  Use BF.py, which
-    adds multiplication and down-sampling, when the priority is range --
-    ten decades there cost 4.5e5 events and returned alpha = -1.005
-    against a theoretical -1.000.  The two agree wherever both can run,
-    which is the point of keeping both.
+    conservation, no weights, no schemes to defend.  Use the weighted
+    engine, which adds multiplication and down-sampling, when the
+    priority is range.
+
+    HISTORICAL MEASUREMENTS, recorded here so they are not mistaken for
+    claims about the present code: on the weighted engine ten decades
+    cost 4.5e5 events and returned alpha = -1.005 against a theoretical
+    -1.000, and the two engines agreed wherever both could run.  That
+    comparison has not been repeated since; re-run it before citing it.
 
 [10] SNAPSHOT PLACEMENT  --  the other half of reaching many decades.
+
+    THIS NOTE IS ABOUT CLOSED RUNS ONLY.  In an OPEN system a genuine
+    steady state exists, the estimator is the average of the
+    instantaneous post-gate snapshots, and dt never enters it at all --
+    so placement is free there and snapshot_mode='events' is harmless.
+    Everything below concerns the closed superposition, where dt is a
+    weight in the sum.  (BF_analysis.py makes the same split; see the
+    comment at superposed_spectrum.)
 
     The closed-system observable is a Riemann sum
     F(m) = sum_k (dN/dm)(m,t_k) dt_k, and the sampling of t has TWO
@@ -264,7 +292,8 @@ METHOD AND THE TRICKS USED, WITH CITATIONS
         samples per decade of m0 everywhere.  Ten decades at k = 30 costs
         300 snapshots, seven times fewer than the failing uniform-t run,
         and places them where the integrand actually lives.  This is the
-        placement to use for any run spanning more than ~2 decades.
+        placement to use for any closed run spanning more than ~2
+        decades.
 
     Note that resampling [9] and placement [10] cure DIFFERENT diseases:
     resampling buys the RANGE (without it N = N_i m_i/m0 dies at ~4
@@ -272,6 +301,99 @@ METHOD AND THE TRICKS USED, WITH CITATIONS
     run with [9] and without [10] has flawless dynamics -- m0 agreed with
     the exact Smoluchowski solution to 1e-14 over ten decades -- and a
     meaningless spectrum.
+
+[11] AGE AND THE MASS AT REBIRTH  --  `m_reset`, not implemented.
+
+    Once clocks are reset mid-cascade (note [7], any rule but
+    'inherit'), tau alone no longer determines the mass.  A tracer's
+    trajectory is the solution of an initial-value problem and depends
+    on the mass it HAD when its clock was zeroed.  Writing u = m^(1/b),
+
+        du/dtau = -c,     u(tau) = u_0 - c tau,     u_0 = m_0^(1/b),
+
+    so the extinction time tau* = u_0/c is set by m_0.  Under 'heavier'
+    that mass is whatever the lighter fragment happened to be, so one
+    age bin collects trajectories whose m_0 spans the full range and
+    whose tau* spread as m_0^(1/b).  Averaging <m> over such a bin can
+    re-smear the very front the rule was introduced to sharpen.
+
+    `m_reset[i]` would record m_0: the particle's mass at its last clock
+    reset, its injection mass if never reset.  It is a RECORDED
+    quantity, not a model input -- tau says how long ago the clock was
+    zeroed, m_reset says at what mass, and without both the event is
+    only half logged.  It would have to be carried through grow(),
+    delete_particle() (swap with last) and add_particle() exactly as
+    inj_time is, and exported as out["final_m_reset"].
+
+    Whether the omission matters is an EMPIRICAL question.  Run
+    'heavier' without it first and look at whether <m>(tau) is clean.
+    If it is not, m_reset is what lets an exponent be FITTED rather than
+    assumed, e.g. from the logarithmic derivative
+
+        dln m / dtau = -b / (tau* - tau),
+
+    which returns b and tau* together, or by scanning beta in
+    m_0^(1/beta) - m^(1/beta) and choosing the beta that minimises the
+    scatter.  Neither procedure presupposes a value.
+
+    Coagulation does not need it: injection there always stamps m_inj,
+    so u_0 is common to every tracer.
+
+[12] FRAGMENT SPLIT WIDTH  --  the one parameter that BIASES alpha.
+
+    xi is drawn uniformly on (0.5 - w, 0.5 + w) with w =
+    frag_split_width, and the pieces are xi*m and (1-xi)*m.  w = 0.5 is
+    the uniform split on (0,1) exactly.
+
+    Narrowing w sharpens the mass-age relation but stops the generations
+    from overlapping: they merge only after ~(mu/2sigma)^2 splits while
+    the cascade takes 6/mu of them, so below about w = 0.25 the spectrum
+    develops a PICKET FENCE at the mean step.  At w = 0.05 the
+    modulation is a factor 2.3 per 0.3 dex; at w = 0.25 it is 13%.
+
+    This matters more than its size suggests, because it is a SYSTEMATIC
+    on alpha, not a variance: a plateau fitted straight through the comb
+    returns a shifted index with a small error bar.  Everything else in
+    this file that goes wrong adds scatter; this shifts the answer.
+
+    Do not go below 0.25 without looking at the raw histogram first.
+    With frag_age_rule = 'heavier' there is no reason to go below it at
+    all -- the tracer is narrow by construction, so the job that a small
+    w was doing is now done by the age rule, and w can go back to 0.5.
+
+----------------------------------------------------------------------
+FAILURE MAP  --  which symptom points at which note
+----------------------------------------------------------------------
+The traps above produce overlapping fingerprints.  Read this before
+concluding that a number is physics:
+
+  alpha -> -2 for EVERY kernel
+        clock advanced per event instead of per trial ............ [5iv]
+        non-local fragmentation, f = 0 ............................. [8]
+        (the two are indistinguishable from the spectrum alone;
+         check the acceptance and the value of frag_min_ratio)
+
+  alpha shifted, spectrum visibly combed
+        frag_split_width below ~0.25 .............................. [12]
+
+  alpha clean, plateau finder reports a tight 1-decade plateau on a
+  CLOSED run that is nonetheless wrong
+        snapshot placement 'events' ............................... [10]
+
+  isochrone as wide as the whole inertial range, median age equal to
+  maximum age
+        clocks never reset; the age class is a family .............. [7]
+
+  alpha clean but b too low
+        the growth-law fit window reaches down into the shelf near
+        m_inj, where <m>(tau) has not left the injection mass.  This
+        is an ANALYSIS bug, not an engine one: fit the plateau in
+        dlog<m>/dlog tau, do not reuse the spectrum's guard band.
+
+  alpha too shallow AND b too low AND the last mass bin rising
+        pile-up at the top of the grid: the flux has nowhere to go.
+        Keep s(T) at least two decades below max(edges), or add an
+        absorbing boundary and drop the last bin from every fit.
 
 ----------------------------------------------------------------------
 ANALYTIC PREDICTIONS THIS CODE IS MEANT TO TEST
@@ -295,8 +417,37 @@ With kernel homogeneity  K(a m1, a m2) = a^lambda K(m1,m2),  and
     exponential and alpha = -2.  That point is simultaneously the
     gelation threshold and the only case in which closed and open agree.
 
-    Constant kernel, lambda = 0 :  closed alpha = -1,   open alpha = -3/2
-    Geometric kernel, lambda=2/3:  closed alpha = -5/3, open alpha = -11/6
+    Constant kernel,  lambda = 0  :  closed alpha = -1,    b = 1
+                                     open   alpha = -3/2,  b = 2
+    Geometric kernel, lambda = 2/3:  closed alpha = -5/3,  b = 3
+                                     open   alpha = -11/6, b = 6
+
+    WHY b IS THE HARD ONE.  Write the spectrum as n(m) ~ m^-tau with
+    tau = -alpha.  In an open run the mass integral is set by the upper
+    cut-off, M_1 ~ s^(2-tau) = J t, so
+
+        b = 1/(2-tau),      db/dtau = 1/(2-tau)^2.
+
+    For the geometric kernel 2 - tau = 1/6, hence db/dtau = 36: a ONE
+    PERCENT error in alpha moves b by a full unit.  Expect alpha to
+    converge cleanly and b not to, quote b to two significant figures at
+    most, and do not read a 5%% discrepancy in b as new physics before
+    checking alpha to three decimals.
+
+    SCOPE.  These predictions describe the INERTIAL RANGE only -- not
+    the neighbourhoods of the injection scale or the sink -- and assume
+    pure coagulation or pure fragmentation, never a mixture.  For
+    fragmentation they require a disruption threshold f > 0 (note [8]);
+    alpha is then independent of f, which is the point of the threshold
+    rather than a coincidence.
+
+    WHAT DEPENDS ON WHAT.  alpha is a property of the steady-state
+    spectrum: it is untouched by age bookkeeping, and `age_rule` /
+    `frag_age_rule` cannot move it.  b is a property of a tracer
+    trajectory and depends on the age rule entirely.  The two are linked
+    only through the closure above, so a disagreement between them is
+    information about the closure -- or about the fit window -- and not
+    automatically an error in either.
 ----------------------------------------------------------------------
 """
 
@@ -423,6 +574,32 @@ def simulate(
                                 # NON-LOCAL against a power-law background (see note [8]) and
                                 # drives the drift from the sink scale instead of from m0.
                                 # Use f of order 0.1-1 for a scale-free (local) cascade.
+    frag_split_width=0.5,       # HALF-WIDTH of the fragment split, fragmentation only.
+                                # xi is drawn uniformly on (0.5 - w, 0.5 + w) and the pieces
+                                # are xi*m and (1-xi)*m.  w = 0.5 is the old uniform split on
+                                # (0,1) exactly, so this default changes nothing.  Smaller w
+                                # narrows the isochrone -- the mass-age relation sharpens --
+                                # but the generations stop overlapping and the spectrum
+                                # develops a picket fence at the mean step.  Generations
+                                # merge only after ~(mu/2sigma)^2 splits while the cascade
+                                # takes 6/mu of them, so w below about 0.25 combs the
+                                # spectrum: at w = 0.05 the modulation is a factor 2.3 per
+                                # 0.3 dex, at w = 0.25 it is 13%.  Do not go below 0.25
+                                # without looking at the raw histogram first.
+    frag_age_rule="inherit",    # AGE INHERITANCE, fragmentation only.  Which fragment keeps
+                                # the parent's clock and which is born now, at t_phys.
+                                #   'inherit'  both keep the parent's t_born (v2 behaviour).
+                                #              The age class is then a FAMILY -- the whole
+                                #              descendant tree of one injected body -- and it
+                                #              spans the entire inertial range by construction.
+                                #   'heavier'  the heavier fragment keeps the clock, the lighter
+                                #              is reborn.  The tracer is the always-heavy chain:
+                                #              a characteristic of the transport equation, i.e.
+                                #              the front.  This is the isochrone one wants.
+                                #   'lighter'  mirror of the above; kept as a sensitivity test,
+                                #              not as physics.
+                                #   'both_new' both reborn.  Null test: destroys the age axis
+                                #              on purpose, so <m>(tau) must collapse to noise.
     # ---- stopping ----
     max_time=np.inf,
     max_events=np.inf,
@@ -480,14 +657,20 @@ def simulate(
     # ------------------------------------------------------------------
     # 0.  Validate and set up
     # ------------------------------------------------------------------
+
     if process not in ("coagulation", "fragmentation"):
         raise ValueError("process must be 'coagulation' or 'fragmentation'")
     if system not in ("closed", "open"):
         raise ValueError("system must be 'closed' or 'open'")
-    if age_rule not in ("min", "mass_weighted", "heavier"):
-        raise ValueError("age_rule must be 'min', 'mass_weighted' or 'heavier'")
-
-    # [v2] The sink gate is now armed BY DEFAULT (10 particles), so a bare
+    if frag_age_rule not in ("inherit", "heavier", "lighter", "both_new"):
+        raise ValueError("frag_age_rule must be 'inherit', 'heavier', "
+                         "'lighter' or 'both_new'")
+    if age_rule not in ("min", "max", "mass_weighted", "heavier"):
+        raise ValueError("age_rule must be 'min', 'max', 'mass_weighted' or 'heavier'")
+    if not (0.0 <= frag_split_width <= 0.5):
+        raise ValueError("frag_split_width is a half-width: 0 <= w <= 0.5 "
+                         "(0.5 = uniform split, 0 = exact halving)")
+    # The sink gate is now armed BY DEFAULT (10 particles), so a bare
     # `raise` here would make every CLOSED run fail on an argument the caller
     # never passed.  Distinguish the two cases with the _Default marker: a value
     # that came from the signature is silently disarmed, a value the caller typed
@@ -687,10 +870,11 @@ def simulate(
     def inherit_age(t1, t2, m1, m2):
         if age_rule == "min":
             return min(t1, t2)                       # oldest ancestor wins
+        if age_rule == "max":
+            return max(t1, t2)                       # youngest ancestor wins
         if age_rule == "heavier":
             return t1 if m1 >= m2 else t2
         return (m1 * t1 + m2 * t2) / (m1 + m2)       # mass-weighted
-
     # ------------------------------------------------------------------
     # 7.  State, counters, snapshot storage
     # ------------------------------------------------------------------
@@ -889,12 +1073,28 @@ def simulate(
                 continue                                 # passive floor: no event
             if frag_min_ratio > 0.0 and ms < frag_min_ratio * mp:
                 continue                                 # impactor too small to disrupt [note 8]
-            xi = rnd()
+            xi = 0.5 + frag_split_width * (2.0 * rnd() - 1.0)
             ma, mb = xi * mp, (1.0 - xi) * mp
-            t_born = float(inj_time[ip])                 # unambiguous: one parent
+            t_par = float(inj_time[ip])                  # the parent's clock
+
+            # Which piece carries the parent's clock and which starts a new one.
+            # 'inherit' reproduces v2 exactly; everything else resets one of the two
+            # to t_phys, which is ALREADY the current time here -- dt was added at the
+            # top of the trial loop, the same t_phys the injector stamps on
+            # new monomers.  Do not recompute it.
+            if frag_age_rule == "inherit":
+                t_a = t_b = t_par
+            elif frag_age_rule == "both_new":
+                t_a = t_b = t_phys
+            else:
+                keep_a = (ma >= mb) if frag_age_rule == "heavier" else (ma < mb)
+                t_a, t_b = (t_par, t_phys) if keep_a else (t_phys, t_par)
+
             mass[ip] = ma
+            inj_time[ip] = t_a          # <-- MUST be written now: the slot is REUSED and
+                                        #     under v2 it was silently already correct.
             move_bin(ip, mass_to_bin(ma))
-            i_new = add_particle(mb, t_born)
+            i_new = add_particle(mb, t_b)
             events += 1; tries_since_event = 0
             if ma < m_min: m_min = ma
             if mb < m_min: m_min = mb
@@ -990,6 +1190,8 @@ def simulate(
         "sink_mass": None if sink_mass is None else float(sink_mass),
         "min_frag_mass": None if min_frag_mass is None else float(min_frag_mass),
         "frag_min_ratio": float(frag_min_ratio),
+        "frag_split_width": float(frag_split_width),   
+        "frag_age_rule": frag_age_rule,     
         "age_rule": age_rule,
         "weight": w,
         "volume": V,

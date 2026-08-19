@@ -13,10 +13,14 @@ to know which state of the code this commit describes.
 
 unreadable: No module named 'numpy'
 
-### open_fragmentation_conservative_geometric_f0.00.npz
+### open_fragmentation_conservative_geometric_f0.30.npz
 
 unreadable: No module named 'numpy'
 
-### open_fragmentation_conservative_geometric_f0.30.npz
+### open_fragmentation_conservative_geometric_f0.30_heavier.npz
+
+unreadable: No module named 'numpy'
+
+### open_fragmentation_conservative_geometric_f0.30_inherit.npz
 
 unreadable: No module named 'numpy'
