@@ -9,14 +9,191 @@ notebook.  What is recorded here is the parameters they were produced with
 and the numbers that came out, which is what a later reader needs in order
 to know which state of the code this commit describes.
 
+### open_coagulation_conservative_constant.npz
+
+| | |
+|---|---|
+| process | coagulation / open |
+| kernel | kernel_constant, lambda = 0 |
+| initial | m = 1, N = 1e+06 |
+| injection | rate 5e+11 at m = 1 |
+| sink | 1000000.0 |
+| age rule | mass_weighted |
+| stopped by | max_events |
+| events | 3.103e+08 |
+| snapshots | 202 |
+| absorbed at sink | 0 |
+| M_sys / m_sink | 311 |
+| K_typ | +1 |
+| N_ss | +1e+06 |
+| age_step | +0.15 |
+| alpha_guard | -1.60303 |
+| alpha_plateau | -1.44888 |
+| alpha_scatter | +0.107443 |
+| alpha_theory | -1.5 |
+| b_iso | +nan |
+| b_theory | +2 |
+| checkpoint | False |
+| flushes | +3.10327e+08 |
+| guard_hi | +316228 |
+| guard_lo | +3.16228 |
+| guard_r2 | +0.979849 |
+| iso_age_bins_used | +0 |
+| lam | +0 |
+| m_inj | +1 |
+| m_sink | +1e+06 |
+| n_out_gate | +10 |
+| n_out_stop | +100 |
+| plateau_decades | +3.3 |
+| plateau_m_hi | +28183.8 |
+| plateau_m_lo | +14.1254 |
+| q | +5e+11 |
+| start | cold |
+| stationary | True |
+| t_c | +1e-06 |
+
 ### open_coagulation_conservative_geometric.npz
 
-unreadable: No module named 'numpy'
+| | |
+|---|---|
+| process | coagulation / open |
+| kernel | kernel_geometric, lambda = 0.6667 |
+| initial | m = 1, N = 1e+06 |
+| injection | rate 2e+12 at m = 1 |
+| sink | 1000000.0 |
+| age rule | mass_weighted |
+| stopped by | stop_sink_events |
+| events | 1.25e+08 |
+| snapshots | 252 |
+| absorbed at sink | 100 |
+| M_sys / m_sink | 14.1 |
+| K_typ | +4 |
+| N_ss | +1e+06 |
+| age_step | +0.05 |
+| alpha_guard | -1.8221 |
+| alpha_plateau | -1.75633 |
+| alpha_scatter | +0.141033 |
+| alpha_theory | -1.83333 |
+| b_iso | +5.12346 |
+| b_theory | +6 |
+| guard_hi | +316228 |
+| guard_lo | +3.16228 |
+| guard_r2 | +0.999062 |
+| iso_age_bins_used | +21 |
+| lam | +0.666667 |
+| m_inj | +1 |
+| m_sink | +1e+06 |
+| n_out_gate | +10 |
+| n_out_stop | +100 |
+| plateau_decades | +4.7 |
+| plateau_m_hi | +707946 |
+| plateau_m_lo | +14.1254 |
+| q | +2e+12 |
+| t_c | +2.5e-07 |
 
 ### open_fragmentation_conservative_geometric_f0.30.npz
 
-unreadable: No module named 'numpy'
+| | |
+|---|---|
+| process | fragmentation / open |
+| kernel | kernel_geometric, lambda = 0.6667 |
+| initial | m = 26.92, N = 6.82142e+06 |
+| injection | rate 3.2e+07 at m = 1e+06 |
+| sink | 1.0 |
+| age rule | min |
+| stopped by | max_events |
+| events | 3.192e+08 |
+| snapshots | 202 |
+| absorbed at sink | 3.205e+08 |
+| M_sys / m_sink | 1.82e+08 |
+| N0 | +6.82142e+06 |
+| N_ss | +4e+06 |
+| age_step | +0.05 |
+| alpha_guard | -1.82929 |
+| alpha_plateau | -1.81155 |
+| alpha_scatter | +0.0753801 |
+| alpha_seed | -1.5 |
+| alpha_theory | -1.83333 |
+| b_gen | +3.48646 |
+| b_gen_resid | +0.0278294 |
+| b_theory | +6 |
+| engine | BF_warm_start_v5 |
+| f_ratio | +0.3 |
+| frag_age_rule | heavier |
+| frag_split_width | +0.5 |
+| gen_max | +192 |
+| gen_ok | +22 |
+| gen_ok_flux | +11 |
+| gen_weight | mass |
+| guard_hi | +398107 |
+| guard_lo | +2.51189 |
+| guard_r2 | +0.999856 |
+| honest_mass | +1 |
+| honest_num | +1 |
+| lam | +0.666667 |
+| live_drift_2nd_half | +0.0225535 |
+| m_inj | +1e+06 |
+| m_sink | +1 |
+| mbar | +45.0005 |
+| mu_step | -0.500005 |
+| plateau_decades | +5.3 |
+| plateau_m_hi | +707946 |
+| plateau_m_lo | +3.54813 |
+| q | +3.2e+07 |
+| seed | +4 |
+| stationarity_dnout_dev | +0.999228 |
+| t_c | +1.25e-07 |
+| t_turn | +1.25e-07 |
+| tau_res | +5.62506e-06 |
+| var_step | +0.25 |
+| wait_b | +5.9404 |
+| wait_band_hi | +707946 |
+| wait_band_lo | +10 |
+| wait_decades | +4.5 |
+| wait_inv_b | +0.168339 |
+| wait_inv_b_interval | +0.162747 |
+| wait_inv_b_sigma | +0.00131621 |
+| wait_inv_b_window | +0.00249204 |
+| warm | True |
+
+### state_open_coagulation_conservative_constant.npz
+
+| | |
+|---|---|
+| process | coagulation / open |
+| kernel | kernel_constant, lambda = 0 |
+| initial | m = 1, N = 1e+06 |
+| injection | rate 5e+11 at m = 1 |
+| sink | 1000000.0 |
+| age rule | mass_weighted |
+| stopped by | max_events |
+| events | 3.103e+08 |
+| snapshots | 202 |
+| absorbed at sink | 0 |
+| M_sys / m_sink | 311 |
+| checkpoint | True |
+| drift_alpha | +7.16149e-10 |
+| drift_mbar | +5.10907e-09 |
+| flushes | +3.10327e+08 |
+| stationary | True |
 
 ### state_open_fragmentation_conservative_geometric_f0.30.npz
 
-unreadable: No module named 'numpy'
+| | |
+|---|---|
+| process | fragmentation / open |
+| kernel | kernel_geometric, lambda = 0.6667 |
+| initial | m = 26.92, N = 6.82142e+06 |
+| injection | rate 3.2e+07 at m = 1e+06 |
+| sink | 1.0 |
+| age rule | min |
+| stopped by | max_events |
+| events | 3.192e+08 |
+| snapshots | 202 |
+| absorbed at sink | 3.205e+08 |
+| M_sys / m_sink | 1.82e+08 |
+| checkpoint | True |
+| drift_alpha | -0.0245905 |
+| drift_mbar | -0.180917 |
+| flushes | +1.73809 |
+| stationary | False |
