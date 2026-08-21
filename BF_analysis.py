@@ -62,7 +62,18 @@ instead of an argument about it.
 
 import numpy as np
 
-import BF_v_no_resampling_v2 as BF
+# The analysis helpers below (local_slope, find_inertial_range, save_run, ...) are
+# identical in every engine, so take whichever is on the path -- newest first.
+try:
+    import BF_warm_start_v5 as BF
+except ImportError:
+    try:
+        import BF_v_no_resampling_v4 as BF
+    except ImportError:
+        try:
+            import BF_v_no_resampling_v3 as BF
+        except ImportError:
+            import BF_v_no_resampling_v2 as BF
 
 # Re-exported from the engine so a notebook imports ONE module.  These are the
 # analysis helpers that live there for historical reasons; they are unchanged.
@@ -74,6 +85,11 @@ superpose           = BF.superpose
 predict             = BF.predict
 iso_mean_mass_raw   = BF.iso_mean_mass      # counts-only version, no error bar
 growth_fit          = BF.growth_fit
+# [v5] present only on the warm-start engine; None on v2/v3/v4 so a notebook can
+# test for them instead of failing on import.
+sample_powerlaw     = getattr(BF, "sample_powerlaw", None)
+steady_N_for_mass   = getattr(BF, "steady_N_for_mass", None)
+ENGINE_NAME         = getattr(BF, "__name__", "?")
 
 
 # ======================================================================
@@ -103,6 +119,37 @@ def describe(run, name=""):
               float(run["mass_drift"])),
            "  %-16s %d snapshots, %d mass bins"
            % ("arrays", np.asarray(run["dndm"]).shape[0], np.asarray(run["centers"]).size)]
+    # [v5] a warm start must announce itself: every statement about ancestry on
+    # such a run is conditional on the honest fraction, and every statement
+    # about alpha is conditional on the seed having been the WRONG slope.
+    if m.get("seeded"):
+        s = m.get("seed") or {}
+        out.append("  %-16s alpha = %+.4f on [%.3g, %.3g], N = %s, <m> = %.4g"
+                   % ("SEEDED (v5)", s.get("alpha", np.nan), s.get("m_lo", np.nan),
+                      s.get("m_hi", np.nan), s.get("N", "?"), s.get("mean_mass", np.nan)))
+    if "honest_num" in run and np.size(run["honest_num"]):
+        out.append("  %-16s %.3f by number, %.3f by mass  (1.0 = no seed left)"
+                   % ("honest at end", float(np.asarray(run["honest_num"])[-1]),
+                      float(np.asarray(run["honest_mass"])[-1])))
+    if "wait_mean" in run:
+        out.append("  %-16s %.4g stays closed in %d bins"
+                   % ("waiting law", float(np.asarray(run["wait_events"]).sum()),
+                      int((np.asarray(run["wait_events"]) > 0).sum())))
+    # [v5] ПРОИСХОЖДЕНИЕ.  Перезапуски составляются, и через месяц по одному
+    # только alpha уже не восстановить, с какого чекпойнта прогон вырос и
+    # сколько физического времени коробка прожила до него.
+    if m.get("restarted_from"):
+        out.append("  %-16s %s" % ("RESTARTED FROM", m["restarted_from"]))
+        out.append("  %-16s %.4g до этого прогона + %.4g в этом = %.4g всего"
+                   % ("t накоплено", m.get("t_origin", 0.0),
+                      float(run.get("final_t_phys", np.nan)),
+                      m.get("t_origin", 0.0) + float(run.get("final_t_phys", np.nan))))
+    if a.get("checkpoint"):
+        out.append("  %-16s %s (%.2f промывки), дрейф <m> %+.3f, alpha %+.4f"
+                   % ("ЧЕКПОЙНТ",
+                      "СТАЦИОНАРЕН" if a.get("stationary") else "точка продолжения",
+                      a.get("flushes", np.nan), a.get("drift_mbar", np.nan),
+                      a.get("drift_alpha", np.nan)))
     if a:
         out.append("  stored analysis:")
         for k in sorted(a):
@@ -138,22 +185,41 @@ def steady_mask(run, frac=0.5, verbose=False):
     """
     Which snapshots belong to the steady state.
 
-    The sink gate is the criterion: it fires once the cascade has demonstrably
-    delivered particles across the whole inertial range, which is exactly the point
-    after which the run is stationary.  Averaging across the transient before it
-    would smear the spectrum rather than sharpen it.  Without a gate, fall back on
-    the last `frac` of the run and say so.
+    THE CRITERION IS THE SINK COUNTER, `n_out`, which is recorded per snapshot: the
+    gate fires once the cascade has demonstrably delivered particles across the whole
+    inertial range, and that is exactly the point after which the run is stationary.
+
+    It is deliberately NOT the gate TIME.  A run with zero_time_at_tracer_start
+    reports t measured from the gate, so t is negative through the fill -- and a
+    stored gate time written on the old clock then lies outside the t array entirely,
+    every snapshot fails the test, and the estimator silently falls back to averaging
+    ONE snapshot.  That happened: a six-decade run with 202 snapshots, 184 of them
+    past the gate, was reduced to K = 1.  A counter cannot be shifted, so it cannot
+    fail that way.
+
+    Falls back to the gate time, then to the last `frac` of the run, and says so.
     """
     t = np.asarray(run["t"], float)
-    t0 = float(run["iso_t_begin"]) if "iso_t_begin" in run else np.nan
-    if np.isfinite(t0):
-        ss = t >= t0
-    else:
-        ss = np.zeros(t.size, bool)
-        ss[int((1.0 - frac) * t.size):] = True
-        if verbose:
-            print("   no sink gate recorded -- averaging the last %.0f%% of snapshots"
-                  % (100 * frac))
+    meta = run.get("meta", {})
+    gate = float(meta.get("iso_start_sink", 0) or 0)
+    n_out = np.asarray(run["n_out"], float) if "n_out" in run else None
+
+    ss = None
+    if n_out is not None and gate > 0:
+        ss = n_out >= gate
+        if ss.sum() >= 1 and verbose:
+            print("   steady mask: %d of %d snapshots past the sink gate (n_out >= %.3g)"
+                  % (ss.sum(), ss.size, gate))
+    if ss is None or ss.sum() < 1:
+        t0 = float(run["iso_t_begin"]) if "iso_t_begin" in run else np.nan
+        if np.isfinite(t0) and t0 <= t.max():
+            ss = t >= t0
+        else:
+            ss = np.zeros(t.size, bool)
+            ss[int((1.0 - frac) * t.size):] = True
+            if verbose:
+                print("   no usable sink gate -- averaging the last %.0f%% of snapshots"
+                      % (100 * frac))
     if ss.sum() < 1:
         ss[-1] = True
     return ss
@@ -895,20 +961,704 @@ def _jsonable(v):
         return str(v)
 
 
+# ======================================================================
+#  GENERATIONS  --  the split count, carried by every particle
+# ======================================================================
+#
+#  WHAT THIS REPLACES.  v2/v3 measured the number of splits along a path with tagged
+#  tracer chains.  The number does not need a path: it is a property of the PARTICLE,
+#  one int32, so v4 carries it on all of them.  The tree count, the shelf at m_inj and
+#  the censoring by the sink -- the three things that limited the tracers -- are gone,
+#  because a particle contributes while it is alive and its generation does not care
+#  how long it waited or whether it survives a full descent.
+#
+#  THE TWO WEIGHTINGS ARE NOT THE SAME, and this is the one thing to get right.
+#  gen_counts counts BOTH fragments, so it is NUMBER weighted and one step of a
+#  uniform split gives <ln xi> = -1, Var = 1.  gen_mass weights by mass, which is what
+#  a tracer did when it followed a fragment with probability xi, and gives -1/2 and
+#  1/4.  Mass weighting is the default here for a practical reason as well as a
+#  principled one: the packet moves half as fast, so it stays clear of the sink for
+#  twice as many generations.  Measured over three decades: number weighting departs
+#  from the line at g = 4, mass weighting holds to g = 10.
+
+
+def steady_mean_mass(alpha, m_lo, m_hi):
+    """
+    <m> = M/N for a truncated power law F ~ m^alpha on [m_lo, m_hi].  Sizes the initial
+    condition: the box must hold N_ss * <m> of mass, so N0 = N_ss * <m> / m_inj.
+
+    Not cosmetic.  The clock is dt = 2V/(wR) with R ~ N^2, so the physical time spent
+    filling goes as 1/N0 and the deterministic injector delivers q*t bodies during it.
+    Measured at three decades: N0 = 4 injects 705 bodies during the fill, N0 = 180
+    injects 200, N0 = 1000 injects 38.  At the low end the run is a decaying cascade
+    wearing the costume of an open one.
+    """
+    a_, lo, hi = float(alpha), float(m_lo), float(m_hi)
+
+    def _int(e):
+        return (np.log(hi / lo) if abs(e + 1.0) < 1e-12
+                else (hi ** (e + 1.0) - lo ** (e + 1.0)) / (e + 1.0))
+
+    return _int(a_ + 1.0) / _int(a_)
+
+
+# ======================================================================
+#  [v5]  THE WAITING LAW  --  b measured as a TIME, not as a density
+# ======================================================================
+#
+#  <dt>(m) is the mean time a particle sits at mass m between successive
+#  events that change its mass.  The engine accumulates it two ways
+#  (engine note [14]):
+#
+#    'exposure'  occupancy / events.  Int N_b(t) dt over the number of
+#                stays that ended in b.  Unbiased under censoring; use it.
+#    'interval'  mean of the completed intervals.  Censored at large m,
+#                which flattens the slope and INFLATES b.  Kept as the
+#                cross-check: exposure and interval agreeing means the
+#                run is long compared with the longest waiting time.
+#
+#  WHAT IT IS AND IS NOT INDEPENDENT OF.  Against a power-law background
+#  the disruption rate of a body of mass m is, by homogeneity of K,
+#
+#      nu(m) = Int_{f m}^{m} K(m,m') n(m') dm'  ~  m^(lambda + alpha + 1),
+#
+#  so the slope of <dt> and alpha carry the SAME exponent information:
+#
+#      1/b = -(1 + lambda + alpha)          [waiting law]
+#      1/b =   2 + alpha                    [flux closure]
+#
+#  and both have db/dalpha = b^2.  Nobody escapes the amplification --
+#  b = 6 is a large number manufactured out of a small one, and that is
+#  physics, not a defect in the estimator.  QUOTE 1/b, WITH ITS ERROR,
+#  AND LET b BE THE DERIVED NUMBER.
+#
+#  What the waiting law does buy, and it is worth having:
+#    - it is a TIME, measured directly, not an exponent inferred from a
+#      density plus a flux argument.  The two routes above differ by
+#      (1 - lambda)/2 - (2 + alpha) evaluated off the fixed point, so
+#      comparing them TESTS the closure instead of assuming it;
+#    - it is MEMORYLESS, so it is valid on a seeded population from t = 0
+#      -- which is the entire reason the warm start exists;
+#    - it is LOCAL: only the bins next to the sink are censored, not the
+#      whole trajectory, which is what killed tau(g) in v4.
+
+
+def waiting_band(run, pad_decades=(1.0, 0.15)):
+    """The default fitting window for <dt>(m), and it is DELIBERATELY ASYMMETRIC.
+
+    Measured on a three-decade fragmentation run, the local slope of <dt>:
+
+        m/m_sink < ~5     slope -2.7, -1.1, -0.8, then +1.1  -- garbage
+        m/m_sink ~ 7..700 slope 0.10 .. 0.30, mean ~0.17     -- the law
+        top bin           slope -0.16                        -- injection pile
+
+    The sink is a HARD truncation and it reaches about a decade up: a particle
+    one bin above it is destroyed on its next event whatever the kinetics say,
+    so <dt> there measures the boundary.  The injection end is a source at a
+    single mass and contaminates only the bin it lands in.  Padding the two
+    ends equally therefore throws away good data at the top and keeps bad data
+    at the bottom -- which is exactly the mistake that turned a clean 1/b =
+    0.174 into 0.220.
+
+    pad_decades: scalar, or (pad at the sink end, pad at the injection end).
+    """
+    meta = run["meta"]
+    m_inj = float(meta.get("injection_mass") or meta["ic"]["m"])
+    m_sink = float(meta.get("sink_mass") or 0.0)
+    try:
+        p_lo, p_hi = float(pad_decades[0]), float(pad_decades[1])
+    except (TypeError, IndexError):
+        p_lo = p_hi = float(pad_decades)
+    if m_sink <= 0 or not np.isfinite(m_sink):
+        c = np.asarray(run["centers"], float)
+        return float(c.min()), float(c.max())
+    if m_sink < m_inj:                       # fragmentation: sink below
+        return m_sink * 10.0 ** p_lo, m_inj / 10.0 ** p_hi
+    return m_inj * 10.0 ** p_hi, m_sink / 10.0 ** p_lo   # coagulation: sink above
+
+
+def waiting_law(run, estimator="exposure", gated=None, band=None,
+                pad_decades=(1.0, 0.15), min_events=200.0, weighted=False,
+                verbose=False, _cross=True):
+    """
+    Fit <dt>(m) = A m^(1/b) and return 1/b, b and the diagnostics.
+
+    band          (m_lo, m_hi) to fit over.  Default: waiting_band(), which is
+                  asymmetric for the reason given there.
+    gated         True  -> the accumulator that started at the steady-state
+                           gate; False -> the one that started at t = 0.
+                  None (default) -> gated if it holds enough events, and the
+                  choice is reported.
+    min_events    a bin needs this many ended stays to enter the fit.
+    weighted      False by DEFAULT, and that is not laziness.  The Poisson
+                  error on a bin with 2e4 events is 0.7%, far below the real
+                  bin-to-bin scatter, which is systematic (residual curvature
+                  from the boundaries) and not statistical.  Weighting by the
+                  Poisson error therefore hands the fit to whichever bin has
+                  the most counts -- always the one nearest the sink, always
+                  the worst one.  Measured on the same run: unweighted gives
+                  1/b = 0.174 +- 0.006 with chi2/dof from the scatter;
+                  weighted gives anything from 0.13 to 0.22 with chi2/dof
+                  between 3 and 260 depending on where the window ends.
+                  Switch it on only after chi2/dof has come down to order 1.
+
+    Returns a dict with p = 1/b and sigma_p (from the scatter), b and
+    sigma_b = b^2 sigma_p, `p_spread` -- the SYSTEMATIC, i.e. how much 1/b
+    moves when the window is trimmed -- and the other estimator's slope, so
+    censoring can be read off rather than assumed.
+    """
+    if "wait_mean" not in run:
+        raise ValueError("this run carries no waiting law "
+                         "(engine older than v5, or track_waiting=False)")
+    c = np.asarray(run["centers"], float)
+    meta = run["meta"]
+    m_inj = float(meta.get("injection_mass") or meta["ic"]["m"])
+    m_sink = float(meta.get("sink_mass") or 0.0)
+
+    # --- which accumulator ------------------------------------------------
+    def _pair(g):
+        sfx = "_gated" if g else ""
+        return (np.asarray(run["wait_mean" + sfx], float),
+                np.asarray(run["wait_sem" + sfx], float),
+                np.asarray(run["wait_events" + sfx], float))
+
+    if gated is None:
+        _, _, n_g = _pair(True)
+        _, _, n_u = _pair(False)
+        gated = bool(n_g.sum() >= 0.5 * n_u.sum() and n_g.sum() > 0)
+    y, sy, n = _pair(gated)
+    if estimator == "interval":
+        sfx = "_gated" if gated else ""
+        y = np.asarray(run["wait_mean_interval" + sfx], float)
+        sy = np.asarray(run.get("wait_sem_interval", np.full_like(y, np.nan)), float)
+        n = np.asarray(run["wait_n" + ("_gated" if gated else "")], float)
+    elif estimator != "exposure":
+        raise ValueError("estimator must be 'exposure' or 'interval'")
+
+    # --- the fitting window ----------------------------------------------
+    if band is None:
+        band = waiting_band(run, pad_decades)
+    band = (min(band), max(band))
+    mask = (c >= band[0]) & (c <= band[1]) & (n >= float(min_events)) \
+        & np.isfinite(y) & (y > 0)
+
+    fit = wls_powerlaw(c, y, sy=(sy if weighted else None), mask=mask)
+    p, sp = fit["p"], fit["sigma_p"]
+
+    # --- SYSTEMATIC: how much does 1/b move if the window is trimmed? -----
+    # The statistical error above is the scatter about one particular window.
+    # It says nothing about the choice of window, which is the larger error on
+    # a shallow slope.  Trim a quarter and a half decade off each end and
+    # report the full spread; if that exceeds sigma_p, the window is the
+    # dominant uncertainty and quoting sigma_p alone is dishonest.
+    trials = []
+    for dlo in (0.0, 0.25, 0.5):
+        for dhi in (0.0, 0.25):
+            bb = (band[0] * 10.0 ** dlo, band[1] / 10.0 ** dhi)
+            mk = (c >= bb[0]) & (c <= bb[1]) & (n >= float(min_events)) \
+                & np.isfinite(y) & (y > 0)
+            if mk.sum() >= 5:
+                q = wls_powerlaw(c, y, sy=(sy if weighted else None), mask=mk)["p"]
+                if np.isfinite(q):
+                    trials.append(q)
+    p_spread = float(np.max(trials) - np.min(trials)) if len(trials) > 1 else np.nan
+    b = 1.0 / p if (np.isfinite(p) and p != 0.0) else np.nan
+    # db/d(1/b) = -b^2.  The SIGN of the amplification does not matter, its
+    # size does: at b = 6 a 1% error in the slope is a 6% error in b.
+    sb = (b ** 2) * sp if np.isfinite(b) and np.isfinite(sp) else np.nan
+
+    # --- the other estimator, for the censoring check ---------------------
+    # _cross=False on the inner call, or the two estimators call each other for
+    # ever.  One level deep is all the cross-check needs.
+    other = "interval" if estimator == "exposure" else "exposure"
+    p_other = np.nan
+    if _cross:
+        try:
+            p_other = waiting_law(run, estimator=other, gated=gated, band=band,
+                                  pad_decades=pad_decades, min_events=min_events,
+                                  weighted=weighted, _cross=False)["p"]
+        except Exception:
+            p_other = np.nan
+
+    # `n` stays what wls_powerlaw meant by it -- the number of BINS in the fit.
+    # The per-bin event counts go in under their own name; overloading `n` here
+    # is how the report ended up trying to print an array with %d.
+    out = dict(fit)
+    out.update(p=p, sigma_p=sp, b=b, sigma_b=sb, mask=mask, m=c, dt=y, sem=sy,
+               n_events=n, band=tuple(band), gated=bool(gated), estimator=estimator,
+               p_other=p_other, other=other, p_spread=p_spread, weighted=bool(weighted),
+               sigma_b_sys=(b ** 2) * p_spread if np.isfinite(b) and np.isfinite(p_spread)
+               else np.nan,
+               decades=(np.log10(c[mask].max() / c[mask].min()) if mask.sum() > 1
+                        else np.nan))
+    if verbose:
+        print(waiting_report(run, out))
+    return out
+
+
+def waiting_report(run, wl=None, alpha=None, sigma_alpha=None):
+    """Text block: 1/b and b from the waiting law, next to b from the closure,
+    with the censoring check and the honest fraction.  Everything a reader needs
+    to decide whether to believe the number."""
+    wl = wl if wl is not None else waiting_law(run)
+    lam = run["meta"].get("lambda")
+    L = ["-" * 74,
+         "WAITING LAW   <dt>(m) ~ m^(1/b)      [%s estimator, %s]"
+         % (wl["estimator"], "gated" if wl["gated"] else "ungated, from t=0"),
+         "  window        %.3g .. %.3g   (%d bins, %.2f decades)"
+         % (wl["band"][0], wl["band"][1], wl["n"], wl["decades"]),
+         "  1/b           %+.5f +- %.5f (stat) +- %.5f (window)   chi2/dof = %s"
+         % (wl["p"], wl["sigma_p"], wl["p_spread"],
+            "n/a" if not np.isfinite(wl["chi2_dof"]) else "%.2f" % wl["chi2_dof"]),
+         "  b             %.3f +- %.3f (stat) +- %.3f (window)"
+         % (wl["b"], wl["sigma_b"], wl["sigma_b_sys"]),
+         "                (sigma_b = b^2 sigma_(1/b): the amplification is physics,"
+         " not a defect)"]
+    if np.isfinite(wl["p_other"]):
+        d = wl["p_other"] - wl["p"]
+        L.append("  cross-check   %s estimator gives 1/b = %+.5f  (%+.5f, %s)"
+                 % (wl["other"], wl["p_other"], d,
+                    "consistent" if abs(d) <= 2 * wl["sigma_p"]
+                    else "DIFFERENT -> censoring, run longer"))
+    if lam is not None and np.isfinite(lam):
+        L.append("  theory        1/b = (1-lambda)/2 = %+.5f   ->  b = %.3f"
+                 % (0.5 * (1 - lam), 2.0 / (1.0 - lam)))
+    if alpha is not None and np.isfinite(alpha):
+        # 1/b = 2 + alpha  (flux closure) and 1/b = -(1+lambda+alpha) (kinetic).
+        # Printing both is the point: they agree only ON the fixed point, so the
+        # gap between them measures how far this run still is from it.
+        L.append("  from alpha    alpha = %+.4f%s" %
+                 (alpha, "" if sigma_alpha is None else " +- %.4f" % sigma_alpha))
+        L.append("                closure  1/b = 2+alpha        = %+.5f  ->  b = %.3f"
+                 % (2 + alpha, 1.0 / (2 + alpha) if (2 + alpha) != 0 else np.nan))
+        if lam is not None and np.isfinite(lam):
+            k = -(1.0 + lam + alpha)
+            L.append("                kinetic  1/b = -(1+lam+alpha) = %+.5f  ->  b = %.3f"
+                     % (k, 1.0 / k if k != 0 else np.nan))
+            L.append("                measured minus kinetic     = %+.5f"
+                     % (wl["p"] - k))
+    hn = run.get("honest_num")
+    if hn is not None and np.size(hn):
+        L.append("  honest        %.3f of the population has a real history"
+                 % float(np.asarray(hn)[-1]))
+    if run["meta"].get("seeded"):
+        s = run["meta"].get("seed") or {}
+        L.append("  SEEDED        alpha_seed = %+.4f on [%.3g, %.3g], N = %s"
+                 % (s.get("alpha", np.nan), s.get("m_lo", np.nan),
+                    s.get("m_hi", np.nan), s.get("N", "?")))
+        L.append("                the measured alpha is only meaningful if it has"
+                 " MOVED off this value")
+    mi, mo = float(np.asarray(run["M_in"])[-1]), float(np.asarray(run["M_out"])[-1])
+    L.append("  mass balance  M_out/M_in = %.3f   (1.0 = the box is flushed)"
+             % (mo / mi if mi > 0 else np.nan))
+    L.append("-" * 74)
+    return "\n".join(L)
+
+
+def time_avg_spectrum(run, gated=None):
+    """dN/dm averaged over the run rather than sampled at snapshots.
+
+    The engine's occupancy integral Int N_b(t) dt is exact and free (it is the
+    denominator of the waiting law), so this spectrum is smooth where the
+    snapshot average is ragged, and it is weighted by TIME rather than by
+    however the snapshots happened to fall.  Returns (m, F) or (None, None) on
+    a pre-v5 run."""
+    if "dndm_time_avg" not in run:
+        return None, None
+    if gated is None:
+        gated = bool(np.isfinite(run.get("wait_t_span_gated", np.nan))
+                     and float(run["wait_t_span_gated"]) > 0)
+    key = "dndm_time_avg_gated" if gated else "dndm_time_avg"
+    return np.asarray(run["centers"], float), np.asarray(run[key], float)
+
+
+def seed_spectrum(alpha, m_lo, m_hi, N, rng=None):
+    """N masses from n(m) ~ m^alpha on [m_lo, m_hi].  Re-exported from the engine
+    so a notebook can draw the seed it is about to hand to simulate()."""
+    if sample_powerlaw is None:
+        raise ValueError("the engine on the path has no seeding (need v5)")
+    return sample_powerlaw(alpha, m_lo, m_hi, N, rng)
+
+
+def honesty(run):
+    """The seeded fraction as a time series: how much of the run is usable for
+    anything that depends on ancestry (generations, isochrones, ages).  On a cold
+    run this is 1.0 everywhere by construction."""
+    if "honest_num" not in run:
+        return None
+    return {"t": np.asarray(run["t"], float),
+            "n_out": np.asarray(run["n_out"], float),
+            "num": np.asarray(run["honest_num"], float),
+            "mass": np.asarray(run["honest_mass"], float),
+            "seeded": bool(run["meta"].get("seeded", False))}
+
+
+# ======================================================================
+#  [v5]  СТАЦИОНАРНОСТЬ  --  когда можно снимать чекпойнт
+# ======================================================================
+#
+#  ДВА ПОПУЛЯРНЫХ КРИТЕРИЯ НЕ РАБОТАЮТ, и это измерено, а не предположено.
+#
+#  M_out/M_in.  Из точного тождества M_out = M_in + M_sys(0) - M_sys(t)
+#  следует M_out/M_in = 1 + dM_sys/M_in, и это стремится к единице просто
+#  потому, что M_in растёт без предела.  Критерий говорит одно: прогон
+#  длиннее заполнения.  Про ФОРМУ спектра он не говорит ничего.
+#
+#  dn_out/devents.  Выходит на единицу после пятой части одной промывки и
+#  дальше стоит.  Это баланс ЧИСЛА, а число живёт у стока и равновесится
+#  на t_turn, тогда как форма живёт наверху и равновесится на tau_res --
+#  в <m>/m_sink раз дольше (на шести декадах в 45 раз).
+#
+#  Замерено на холодном шестидекадном прогоне, в промывках коробки
+#  (одна промывка = M_sys/m_sink событий):
+#
+#      промывок  live/1e6   <m>     alpha    dn_out/dev   M_out/M_in
+#        0.18      14.3     16.2   -1.890       0.96
+#        0.46       9.4     22.5   -1.881       1.01
+#        0.73       8.1     24.4   -1.879       1.02
+#        1.01       6.9     26.6   -1.862       1.02
+#        1.29       5.9     30.6   -1.829       1.02         1.016
+#
+#  Оба «критерия» отрапортовали успех на 0.2 промывки.  При этом <m> росло
+#  по 14 за промывку и alpha ехало, причём в конце быстрее, чем в начале.
+#  Работают только <m> и alpha, сравненные между половинами хвоста.
+
+
+def stationarity(run, tail=0.5, tol_mbar=0.03, tol_alpha=0.010,
+                 tol_msys=0.03, band_pad=1.0, verbose=False):
+    """ДОПУСКИ ЗАДАНЫ НА ОДНУ ПРОМЫВКУ, а не на окно сравнения.  Это не деталь,
+    а единственное, что делает тест осмысленным на коротком прогоне.
+
+    Сдвиг между половинами хвоста тем меньше, чем короче прогон -- окно сжимается
+    вместе с ним.  Сравнивать такой сдвиг с фиксированным порогом значит объявлять
+    стационарным всё, что достаточно коротко.  Замерено на двух холодных прогонах
+    одной и той же конфигурации:
+
+        длина 1.31 промывки:  сдвиг <m> +13.0%  на разносе 0.33 промывки
+        длина 0.29 промывки:  сдвиг <m>  +2.8%  на разносе 0.073 промывки
+
+    Второй прошёл бы порог 3% и получил бы «СТАЦИОНАРЕН» при <m> = 16.8 против
+    предельных 45 и M_out/M_in = 0.32.  Поделённые на разнос, оба дают ОДНУ И ТУ
+    ЖЕ скорость -- 39% на промывку, -- и оба честно объявляются едущими."""
+    """Стационарен ли прогон настолько, чтобы снимать с него чекпойнт.
+
+    Берётся ХВОСТ прогона (последняя доля `tail` снимков), делится пополам, и
+    сравниваются средние по половинам.  Сравнение половин хвоста, а не начала с
+    концом: нас интересует, движется ли система СЕЙЧАС, а не насколько далеко
+    она ушла от начального условия.
+
+    Проверяется:
+      mbar   <m> = M_sys/N        -- самый острый индикатор формы
+      alpha  наклон на охранной полосе, снимок за снимком
+      msys   полная масса         -- производная, а не кумулятивное отношение
+      dnout  dn_out/devents       -- слабый, оставлен для полноты картины
+
+    Возвращает dict с посуточными числами, вердиктом `ok` и текстом `report`.
+    Допуски по умолчанию: 3% на <m> и M_sys, 0.010 на alpha -- последнее
+    примерно вчетверо меньше типичного разброса плато, то есть требование
+    строже, чем точность, с которой alpha вообще меряется.
+    """
+    e = np.asarray(run["events"], float)
+    if e.size < 8:
+        return {"ok": False, "report": "снимков меньше восьми -- судить не о чем",
+                "n": int(e.size)}
+    lv = np.asarray(run["live"], float)
+    Ms = np.asarray(run["M_sys"], float)
+    no = np.asarray(run["n_out"], float)
+    c = np.asarray(run["centers"], float)
+    D = np.asarray(run["dndm"], float)
+    meta = run["meta"]
+    m_inj = float(meta.get("injection_mass") or meta["ic"]["m"])
+    m_sink = float(meta.get("sink_mass") or 0.0)
+    lo, hi = (m_sink, m_inj) if m_sink < m_inj else (m_inj, m_sink)
+    band = (c >= lo * 10.0 ** band_pad) & (c <= hi / 10.0 ** band_pad)
+
+    mbar = np.where(lv > 0, Ms / np.maximum(lv, 1), np.nan)
+    al = np.full(e.size, np.nan)
+    for i in range(e.size):
+        k = band & (D[i] > 0)
+        if k.sum() >= 6:
+            al[i] = np.polyfit(np.log(c[k]), np.log(D[i][k]), 1)[0]
+
+    i0 = max(int(e.size * (1.0 - tail)), 0)
+    idx = np.arange(i0, e.size)
+    half = i0 + (e.size - i0) // 2
+    A, B = np.arange(i0, half), np.arange(half, e.size)
+    if A.size < 2 or B.size < 2:
+        return {"ok": False, "report": "хвост слишком короткий для двух половин",
+                "n": int(e.size)}
+
+    #  ОШИБКА СДВИГА, и без неё вердикт был бы гаданием.  Снимки СИЛЬНО
+    #  коррелированы -- соседние делят почти всю популяцию, -- поэтому наивная
+    #  ошибка по числу снимков занижена в разы.  effective_snapshots даёт
+    #  K(1-rho)/(1+rho) по автокорреляции на лаге один; на реальных прогонах
+    #  из 168 снимков независимых оказывается около четырёх.
+    def _cmp(x, rel):
+        a, b = np.nanmean(x[A]), np.nanmean(x[B])
+        sa = np.nanstd(x[A]) / np.sqrt(max(effective_snapshots(x[A]), 1.0))
+        sb = np.nanstd(x[B]) / np.sqrt(max(effective_snapshots(x[B]), 1.0))
+        sd = float(np.hypot(sa, sb))
+        if rel:
+            d = (b - a) / a if np.isfinite(a) and a != 0 else np.nan
+            sd = sd / abs(a) if np.isfinite(a) and a != 0 else np.nan
+        else:
+            d = b - a
+        return a, b, d, sd
+
+    mb_a, mb_b, d_mb, s_mb = _cmp(mbar, True)
+    ms_a, ms_b, d_ms, s_ms = _cmp(Ms, True)
+    al_a, al_b, d_al, s_al = _cmp(al, False)
+    dn = (no[-1] - no[i0]) / max(e[-1] - e[i0], 1.0)
+
+    #  РАЗНОС половин в промывках -- на него и делится сдвиг.  Берутся средние
+    #  позиции половин, а не их края: сдвиг между средними и относится к
+    #  расстоянию между средними.
+    flush0 = Ms[0] / m_sink if m_sink > 0 else np.nan
+    span = (float(e[B].mean()) - float(e[A].mean())) / flush0 if np.isfinite(flush0) else np.nan
+    if not np.isfinite(span) or span <= 0:
+        span = np.nan
+    d_mb, s_mb = d_mb / span, s_mb / span
+    d_ms, s_ms = d_ms / span, s_ms / span
+    d_al, s_al = d_al / span, s_al / span
+
+    flush = flush0
+    #  ТРИ исхода, а не два.  Сдвиг может быть (а) мал -- сошлось; (б) велик И
+    #  значим -- едет; (в) велик, но в пределах собственной ошибки -- сказать
+    #  нечего, нужна статистика.  Без третьего случая тест на коротком прогоне
+    #  уверенно объявлял бы «едет» по шуму.
+    checks = [("<m>", d_mb, s_mb, tol_mbar), ("alpha", d_al, s_al, tol_alpha),
+              ("M_sys", d_ms, s_ms, tol_msys)]
+
+    def _verdict(v, sd, t):
+        if not np.isfinite(v):
+            return "?"
+        if abs(v) <= t:
+            return "ok"
+        return "ЕДЕТ" if (np.isfinite(sd) and abs(v) > 2.0 * sd) else "шум?"
+
+    verd = [_verdict(v, sd, t) for _, v, sd, t in checks]
+    ok = all(x == "ok" for x in verd)
+    noisy = any(x == "шум?" for x in verd)
+
+    L = ["-" * 70,
+         "СТАЦИОНАРНОСТЬ  (две половины последних %.0f%% снимков)" % (100 * tail),
+         "  длина прогона   %.3g событий = %.2f промывки коробки" % (e[-1], e[-1] / flush)
+         if np.isfinite(flush) else "  длина прогона   %.3g событий" % e[-1],
+         "  разнос половин  %.4f промывки -- на него поделены все сдвиги" % span,
+         "  %-8s %11s %11s %18s  %-7s %s"
+         % ("", "первая", "вторая", "сдвиг/промывку", "порог", "вердикт")]
+    for (name, v, sd, t), vd in zip(checks, verd):
+        a, b = ((mb_a, mb_b) if name == "<m>" else
+                (al_a, al_b) if name == "alpha" else (ms_a, ms_b))
+        L.append("  %-8s %11.4g %11.4g %18s  %-7.3g %s"
+                 % (name, a, b, "%+.4f +- %.4f" % (v, sd), t, vd))
+    L.append("  %-8s %11.3f %11s %11s  %-8s %s"
+             % ("dn/dev", dn, "", "", "1.00",
+                "(слабый критерий: садится на единицу задолго до формы)"))
+    mi = float(np.asarray(run["M_in"])[-1]); mo = float(np.asarray(run["M_out"])[-1])
+    L.append("  %-8s %11.3f %11s %11s  %-8s %s"
+             % ("M_o/M_i", mo / mi if mi > 0 else np.nan, "", "", "1.00",
+                "(слабый: -> 1 автоматически, см. заметку выше)"))
+    L.append("  ВЕРДИКТ: %s"
+             % ("СТАЦИОНАРЕН -- годится как старт измерения" if ok else
+                ("НЕ СТАЦИОНАРЕН -- продолжать" if not noisy else
+                 "НЕ СТАЦИОНАРЕН, но часть сдвигов в пределах шума -- "
+                 "нужна длина, а не вердикт")))
+    if noisy:
+        L.append("  («шум?»: сдвиг больше допуска, но меньше двух своих ошибок --")
+        L.append("   отличить движение от флуктуации на этой длине нельзя.)")
+    else:
+        L.append("  (ошибка сдвига считана по НЕЗАВИСИМЫМ снимкам: соседние делят")
+        L.append("   популяцию, и наивная ошибка по их числу занижена в разы.)")
+    # ---- сколько ещё, если не сошлось ----------------------------------
+    #  Модель: <m>(n) = M_inf - A exp(-n/n0) по промывкам n.  Тогда ДРЕЙФ,
+    #  измеренный на окне, сам затухает как exp(-n/n0) с тем же n0.  Значит n0
+    #  достаётся сравнением дрейфа на двух последовательных окнах, а число
+    #  промывок до допуска есть n0 * ln(d/tol).  Линейная экстраполяция тут не
+    #  годится в принципе: при постоянной скорости дрейфа сходимость не
+    #  наступает никогда, и «ещё столько-то» было бы выдумкой.
+    est = np.nan
+    if not ok and np.isfinite(d_mb) and abs(d_mb) > tol_mbar and np.isfinite(flush):
+        t0 = max(int(e.size * (1.0 - min(tail * 1.5, 0.9))), 0)
+        cut = np.array_split(np.arange(t0, e.size), 3)
+        if all(c_.size >= 2 for c_ in cut):
+            mm = [float(np.nanmean(mbar[c_])) for c_ in cut]
+            d1 = (mm[1] - mm[0]) / mm[0]
+            d2 = (mm[2] - mm[1]) / mm[1]
+            dn_fl = float(e[cut[2]].mean() - e[cut[1]].mean()) / flush
+            if np.isfinite(d1) and np.isfinite(d2) and d1 * d2 > 0 and abs(d2) < abs(d1):
+                n0 = dn_fl / np.log(abs(d1) / abs(d2))
+                est = n0 * np.log(abs(d_mb) / tol_mbar)
+                L.append("  оценка: дрейф <m> затухает с масштабом %.2f промывки," % n0)
+                L.append("          до допуска %.0f%% ещё около %.1f промывки = %.3g событий"
+                         % (100 * tol_mbar, est, est * flush))
+            else:
+                L.append("  оценка: дрейф <m> НЕ затухает на хвосте (%+.3f -> %+.3f) --"
+                         % (d1, d2))
+                L.append("          прогон далеко от стационара, срок назвать нельзя")
+    L.append("-" * 70)
+    rep = "\n".join(L)
+    if verbose:
+        print(rep)
+    return {"ok": bool(ok), "report": rep, "flushes": float(e[-1] / flush) if np.isfinite(flush) else np.nan,
+            "mbar": (mb_a, mb_b, d_mb, s_mb), "alpha": (al_a, al_b, d_al, s_al),
+            "msys": (ms_a, ms_b, d_ms, s_ms), "dn_dev": float(dn),
+            "verdicts": dict(zip(("mbar", "alpha", "msys"), verd)),
+            "noisy": bool(noisy),
+            "flushes_left": float(est),
+            "mbar_series": mbar, "alpha_series": al, "events": e}
+
+
+def generations(run, weight="mass"):
+    """
+    Unpack the generation histogram.  weight is 'mass' or 'number'.
+
+    Returns dict(g, H, centers, widths, x, num, tau, n_eff) where H[g] is the mass (or
+    number) distribution of generation g over the mass grid, and x = ln(m/m_inj).
+    """
+    if "gen_counts" not in run:
+        raise ValueError("this run carries no generation histogram (engine older than v4)")
+    H = np.asarray(run["gen_mass" if weight == "mass" else "gen_counts"], float)
+    c = np.asarray(run["centers"], float)
+    minj = float(run["meta"].get("injection_mass") or run["meta"]["ic"]["m"])
+    return {"g": np.arange(H.shape[0]), "H": H, "centers": c,
+            "widths": np.asarray(run["widths"], float), "x": np.log(c / minj),
+            "num": np.asarray(run["gen_num"], float),
+            "tau": np.asarray(run["gen_tau"], float),
+            "tau_live": np.asarray(run.get("gen_tau_live", run["gen_tau"]), float),
+            "reach_n": np.asarray(run.get("gen_reach_n", run["gen_num"]), float),
+            "m_inj": minj, "m_sink": float(run["meta"].get("sink_mass") or 0.0),
+            "weight": weight, "snapshots": float(run.get("gen_snapshots", 0.0))}
+
+
+def gen_moments(gen, min_count=500.0, clear_sink=2.0):
+    """
+    <x> and Var(x) per generation, with a VALIDITY MASK.
+
+    The mask is the whole point.  The sink truncates the packet from below, so a
+    generation whose distribution has reached it is measuring the boundary, not the
+    walk -- its mean saturates and its variance collapses towards zero.  A generation
+    counts as usable while
+
+        <x> - clear_sink * sigma  >  ln(m_sink / m_inj),
+
+    i.e. while the packet is still `clear_sink` standard deviations clear of the sink.
+    Fitting through the saturated tail is the documented way to get a clean-looking
+    slope that is simply wrong.
+    """
+    H, x = gen["H"], gen["x"]
+    xs = np.log(gen["m_sink"] / gen["m_inj"]) if gen["m_sink"] > 0 else -np.inf
+    n = H.sum(axis=1)
+    mu = np.full(H.shape[0], np.nan); va = np.full(H.shape[0], np.nan)
+    for g in range(H.shape[0]):
+        if n[g] < min_count:
+            continue
+        p = H[g] / n[g]
+        mu[g] = float((p * x).sum())
+        va[g] = float((p * (x - mu[g]) ** 2).sum())
+    ok = np.isfinite(mu) & (mu - clear_sink * np.sqrt(np.maximum(va, 0)) > xs)
+    ok[0] = False                      # generation 0 has not moved yet
+
+    #  SECOND CUT, and it matters for tau(g) rather than for the moments.  Every split
+    #  makes two particles out of one, so the number that REACH generation g DOUBLES
+    #  with g -- it is not flat, and treating it as flat is wrong.  What is flat is the
+    #  ratio reach_n[g] / reach_n[g-1] = 2, and it stays at 2 exactly until the sink
+    #  starts removing fragments before they can split again.  Measured on a
+    #  three-decade test: 1.93, 1.96, 2.03, 2.09, 2.05, then 1.94, 1.76, 1.60, 1.43 --
+    #  the sink bites at g = 7.  Beyond that the particles that reached g are the FAST
+    #  ones, a survivor bias that compresses tau(g) and drags b down.
+    rn = np.asarray(gen.get("reach_n", n), float)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        ratio = np.full(rn.size, np.nan)
+        ratio[1:] = rn[1:] / np.where(rn[:-1] > 0, rn[:-1], np.nan)
+    ok_flux = np.nan_to_num(ratio, nan=0.0) > 1.8
+    return {"g": gen["g"], "mu": mu, "var": va, "n": n, "ok": ok,
+            "ok_flux": ok & ok_flux, "reach_n": rn, "reach_ratio": ratio,
+            "x_sink": xs}
+
+
+def gen_growth(gen, mom=None, min_count=500.0, s_max=120.0):
+    """
+    b from <tau>(g): the mean time to reach generation g, over the whole population.
+
+    Same statement as the tracer version, on 10^4 times the sample.  Splits happen at
+    rate nu(m) ~ m^(beta-1) and <ln m> falls by <ln xi> per split, so with
+    beta - 1 = -1/b,
+
+        tau(g) = T (1 - exp(-g / (2b / |<ln xi>| / 2)))   ->  scale = b / |<ln xi>|.
+
+    With the MASS weighting <ln xi> = -1/2 and the scale is 2b, exactly as for the
+    tracers; with NUMBER weighting <ln xi> = -1 and the scale is b.  `resid` against
+    `resid_linear` is the verdict: a tau(g) that is barely curved does not determine b.
+    """
+    if mom is None:
+        mom = gen_moments(gen, min_count=min_count)
+    #  tau(g) is fitted on the flux-flat range only -- see gen_moments.  Outside it the
+    #  sample at each g is the fast tail and the curve is compressed.
+    k = mom.get("ok_flux", mom["ok"]) & np.isfinite(gen["tau"])
+    if k.sum() < 4:
+        return {"b": np.nan, "T": np.nan, "g": gen["g"][k], "tau": gen["tau"][k],
+                "resid": np.nan, "resid_linear": np.nan, "scale": np.nan}
+    gf, tf = gen["g"][k].astype(float), gen["tau"][k]
+    sg = np.linspace(0.5, s_max, int(4 * s_max) + 1)
+    rs = []
+    for sv in sg:
+        h = 1.0 - np.exp(-gf / sv)
+        T = np.sum(tf * h) / np.sum(h * h)
+        rs.append(np.std(tf - T * h))
+    rs = np.array(rs); sb = float(sg[np.argmin(rs)])
+    h = 1.0 - np.exp(-gf / sb); T = float(np.sum(tf * h) / np.sum(h * h))
+    lin = np.polyfit(gf, tf, 1)
+    mu_step = 0.5 if gen["weight"] == "mass" else 1.0
+    return {"b": sb * mu_step, "scale": sb, "T": T, "g": gf, "tau": tf,
+            "resid": float(rs.min() / tf.std()),
+            "resid_linear": float(np.std(tf - np.polyval(lin, gf)) / tf.std())}
+
+
+def step_stats(frag_split_width, weight="mass"):
+    """
+    (<ln xi>, Var(ln xi)) for ONE split, exactly, by quadrature.
+
+    weight='mass'   -- the piece is met with probability xi (p ~ xi): -1/2, 1/4 at w=1/2.
+    weight='number' -- both pieces counted equally:                   -1,   1    at w=1/2.
+
+    No free parameter, which is what makes <x> and Var(x) against g the sharpest test
+    in the analysis.  The skewness of one step is -2 whenever the piece can be
+    arbitrarily small, because ln of it then has an exponential tail; only "always the
+    heavier" is bounded and comes out nearly symmetric.  Skewness after g steps falls
+    as 1/sqrt(g), so it is a small-g transient, not an obstruction.
+    """
+    xi = np.linspace(0.5 - frag_split_width, 0.5 + frag_split_width, 200001)[1:-1]
+    tz = np.trapezoid if hasattr(np, "trapezoid") else np.trapz
+    p = (xi if weight == "mass" else np.ones_like(xi))
+    p = p / tz(p, xi)
+    mu = float(tz(p * np.log(xi), xi))
+    return mu, float(tz(p * np.log(xi) ** 2, xi) - mu ** 2)
+
+
 def add_last_run(run, name, analysis=None, drop_particles=True, runs_dir="runs"):
     """
     Write one finished run to runs/<name>.npz, replacing the previous one.
 
-    Everything simulate() returns is kept except `final_mass` and `final_inj_time`:
-    those carry the whole live population, one float per particle, and no figure
-    needs them because the spectra and the isochrone histogram are stored in their
-    own right.  `analysis` is merged into meta, which save_run stores as JSON, so it
+    Everything simulate() returns is kept except `final_mass`, `final_inj_time` and
+    `final_age`: those carry the whole live population, one float per particle, and no
+    figure needs them because the spectra and the isochrone histogram are stored in
+    their own right.  (`final_age` arrived with the v3 spin-up, where the triple
+    (final_mass, final_age) IS the initial condition of the next run -- so if that is
+    what you are saving, pass drop_particles=False and save it under its own name;
+    it does not belong in a run archive that the analysis notebooks reload.)
+
+    EVERYTHING TRACER-RELATED IS KEPT: `tracer_hist`, `tracer_done`, `tracer_t0_all`,
+    `tracer_m0_all`.  The full trajectory log is the point of the feature and it is
+    chain-indexed, not particle-indexed, so it does not scale with N.  `analysis` is merged into meta, which save_run stores as JSON, so it
     survives load without any engine change; `stop_reason` is copied there too
     because save_run drops top-level strings.
     """
     import os
     payload = {k: v for k, v in run.items()
-               if not (drop_particles and k in ("final_mass", "final_inj_time"))}
+               if not (drop_particles and k in ("final_mass", "final_inj_time",
+                                                "final_age", "final_gen",
+                                                "final_gen_time"))}
     meta = dict(run["meta"])
     meta["stop_reason"] = run.get("stop_reason", meta.get("stop_reason"))
     meta["saved_as"] = name

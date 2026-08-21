@@ -17,10 +17,6 @@ unreadable: No module named 'numpy'
 
 unreadable: No module named 'numpy'
 
-### open_fragmentation_conservative_geometric_f0.30_heavier.npz
-
-unreadable: No module named 'numpy'
-
-### open_fragmentation_conservative_geometric_f0.30_inherit.npz
+### state_open_fragmentation_conservative_geometric_f0.30.npz
 
 unreadable: No module named 'numpy'

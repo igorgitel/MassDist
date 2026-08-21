@@ -1,5 +1,5 @@
 """
-BF_v_no_resampling_v2.py  --  Majorant_v2
+BF_v_no_resampling_v4.py  --  Majorant_v2
 
 ONE event-driven Monte Carlo engine for the mass-space cascade, covering
 all four configurations with the same code path:
@@ -136,52 +136,100 @@ METHOD AND THE TRICKS USED, WITH CITATIONS
     which removes shot noise at the injection scale.  This is a
     modelling choice and is stated in the output metadata.
 
-[7] Isochrone (age) bookkeeping.
+[7] AGE AND TRAJECTORY BOOKKEEPING.
 
-    Every particle carries `inj_time`, the moment its own clock was last
-    set; the histogram bins tau = t_phys - inj_time.  Accumulation does
-    not begin until the sink has swallowed `iso_start_sink` physical
-    particles (default 10) -- the one steady-state statement that needs
-    no retuning when N_ss, the kernel or the mass range changes.  A
-    CLOSED system has no sink, so the default gate is silently disarmed
-    there; only an explicitly passed value still raises.
+    Two mechanisms sit side by side here.  Ages label an ENSEMBLE; tracers follow a
+    TRAJECTORY.  They answer different questions and are read differently.
 
-    What tau MEANS depends on when clocks may be reset, and the two
-    processes are not symmetric.
+    ---- AGES -------------------------------------------------------------------
 
-    COAGULATION.  A merged particle has two ancestors, so an inheritance
-    rule is needed: `age_rule` ('min'|'max'|'mass_weighted'|'heavier').
-    Clocks are set at injection only, always on a particle of mass
-    m_inj, so every tracer starts from the same mass and <m>(tau) is
-    well posed.  Report the rule and test its sensitivity -- 'min' and
-    'heavier' weight the tail of the merger tree differently.
+    Every particle carries `inj_time`, the moment its own clock was last set; the
+    histogram bins tau = t_phys - inj_time.  Accumulation does not begin until the
+    sink has swallowed `iso_start_sink` physical particles (default 10) -- the one
+    steady-state statement that needs no retuning when N_ss, the kernel or the mass
+    range changes.  A CLOSED system has no sink, so the default gate is silently
+    disarmed there; only an explicitly passed value still raises.
 
-    FRAGMENTATION.  A fragment has one parent, so nothing is ambiguous
-    -- but that is not the same as nothing being chosen, and the first
-    version of this engine mistook the one for the other.  With both
-    fragments keeping the parent's stamp, no clock is ever reset and an
-    "age class" is the whole descendant tree of one injected body: a
-    FAMILY, spanning the full inertial range by construction, however
-    long the run.  Not an isochrone.  (Diagnostic: under 'inherit' the
-    median age equals the maximum age, because essentially every live
-    particle descends from t = 0.)
+    COAGULATION.  A merged particle has two ancestors, so an inheritance rule is
+    needed: `age_rule` ('min'|'max'|'mass_weighted'|'heavier').  Clocks are set at
+    injection only, always on a particle of mass m_inj, so every age class starts
+    from the same mass and <m>(tau) is well posed.  Report the rule and test its
+    sensitivity -- 'min' and 'heavier' weight the tail of the merger tree
+    differently.
 
-    `frag_age_rule` picks which piece keeps the clock:
-        'inherit'   both do -- the old behaviour, kept as the null case.
-        'heavier'   heavier keeps it, lighter is reborn at t_phys.  The
-                    tracer is then the always-heavy chain: a
-                    characteristic of the transport equation, i.e. the
-                    FRONT.  The physical choice.
+    FRAGMENTATION.  A fragment has one parent, so nothing is ambiguous -- but that
+    is not the same as nothing being chosen.  `frag_age_rule` picks which piece
+    keeps the parent's clock:
+
+        'inherit'   both do.  No clock is ever reset, so an age class is the whole
+                    descendant tree of one injected body -- a FAMILY.  Diagnostic:
+                    the median age equals the maximum age, because essentially
+                    every live particle descends from t = 0.
+        'heavier'   heavier keeps it, lighter is reborn at t_phys.
         'lighter'   mirror image; a sensitivity test, not physics.
-        'both_new'  both reborn; kills the age axis on purpose, so a
-                    surviving <m>(tau) trend is a bug.
+        'both_new'  both reborn; removes the age axis on purpose, so a surviving
+                    <m>(tau) trend is a bug.
 
-    The rule is diagnostic only: it touches no mass and consumes no
-    random numbers.  Same seed, different rule => identical `live`,
-    `M_sys`, `sink_events`.  If not, it has leaked into the dynamics.
+    Read an age class as an ENSEMBLE, not as a path.  Splitting multiplies carriers,
+    so a class collects the whole tree at once and its width in log m is set by the
+    spread of birth masses within it, not by tau.  That is what tracers are for.
 
-    Note that alpha does not depend on this rule at all and b depends on
-    it entirely -- see the closing paragraph of the predictions below.
+    ---- GENERATIONS -------------------------------------------------------------
+
+    [v4] Every particle carries `gen`, the number of splits between it and the body
+    that ENTERED the system, and `gen_time`, the moment that body entered.  A snapshot
+    bins the live population by (gen, mass) exactly as the isochrones bin it by
+    (age, mass).
+
+    WHY THIS REPLACES THE TRACERS.  What a tracer chain was ever for is the number of
+    splits along a path: x = ln(m/m0) is a sum of ln(xi) over splits, so <x> and Var(x)
+    are linear in that number with slopes that are pure numbers, and everything about
+    the trajectory follows.  But that number does not need a tagged path -- it is a
+    property of the PARTICLE and it fits in one int32.  So it is carried by every
+    particle instead of by a few thousand tagged ones, and the statistics improve by
+    four orders of magnitude for 16 MB at N = 4e6.
+
+    Three problems disappear with the tracers rather than being solved:
+      - the number of independent TREES, which no tracer setting could raise above
+        n_out/R (tens at six decades), stops being the limit: a generation histogram is
+        built from the whole population;
+      - the shelf at m_inj, which held 92% of the tracer dwell time in a measured run,
+        no longer decides what is sampled -- a particle's generation does not care how
+        long it waited;
+      - censoring by the sink is gone, because a particle is counted while it is alive
+        and nothing has to survive a full descent to contribute.
+
+    AND THE CLOCK COMES FREE.  Accumulating the age alongside the count gives <tau>(g),
+    the mean time to reach generation g over the whole population.  That is the curve a
+    tracer log gave as <tau>(k), and it carries b the same way:
+
+        dg/dtau ~ nu(m) ~ m^(beta-1),  <ln m> falls by <ln xi> per split, so
+        tau(g) = T (1 - exp(-g/(2b)))   with <ln xi> = -1/2 at w = 1/2.
+
+    WHAT IS LOST.  A generation histogram is an ENSEMBLE at fixed g, not a path: it
+    cannot say which particle came from which, so correlations BETWEEN successive steps
+    of one trajectory are not measurable from it.  For the multiplicative picture that
+    is no loss, because independence of the steps is exactly what makes <x> and Var(x)
+    linear in g -- and that linearity IS the test.
+
+    THE SPLIT IS SIZE-BIASED ONLY ALONG A PATH, NOT HERE.  A tracer followed a fragment
+    with probability xi and therefore saw <ln xi> = -1/2.  A generation histogram counts
+    BOTH fragments, so the number-weighted step applies: <ln xi> = -1 and Var = 1 for a
+    uniform split.  Same tree, different weighting -- use the right pair of numbers.
+    Weighting the histogram by mass recovers -1/2 and 1/4.
+
+    ASYMMETRY.  Whenever the followed piece can be arbitrarily small, ln of it has an
+    exponential tail and the skewness of one step is exactly -2, whatever the rule --
+    which is why "random piece", "always lighter" and "the tracer" all measured -1.99.
+    Only "always the heavier" is bounded, xi in [1/2,1], and comes out nearly symmetric
+    at -0.24.  Skewness after g steps falls as -2/sqrt(g), so it is a small-g transient
+    and not an obstruction; at g = 28 it is -0.38.
+
+    INHERITANCE.  Fragmentation: both fragments take gen+1 and keep gen_time, so
+    tau = t - gen_time is the time since the ANCESTOR entered, whatever frag_age_rule
+    does to inj_time (which still serves the isochrones and is a separate field on
+    purpose).  Coagulation: the product takes max(gen_i, gen_j) + 1 and the older
+    gen_time.  Injection and the initial condition: gen = 0, gen_time = now.
 
 [8] LOCALITY OF THE FRAGMENTATION RULE  --  a physics trap, not a bug.
 
@@ -302,44 +350,7 @@ METHOD AND THE TRICKS USED, WITH CITATIONS
     the exact Smoluchowski solution to 1e-14 over ten decades -- and a
     meaningless spectrum.
 
-[11] AGE AND THE MASS AT REBIRTH  --  `m_reset`, not implemented.
-
-    Once clocks are reset mid-cascade (note [7], any rule but
-    'inherit'), tau alone no longer determines the mass.  A tracer's
-    trajectory is the solution of an initial-value problem and depends
-    on the mass it HAD when its clock was zeroed.  Writing u = m^(1/b),
-
-        du/dtau = -c,     u(tau) = u_0 - c tau,     u_0 = m_0^(1/b),
-
-    so the extinction time tau* = u_0/c is set by m_0.  Under 'heavier'
-    that mass is whatever the lighter fragment happened to be, so one
-    age bin collects trajectories whose m_0 spans the full range and
-    whose tau* spread as m_0^(1/b).  Averaging <m> over such a bin can
-    re-smear the very front the rule was introduced to sharpen.
-
-    `m_reset[i]` would record m_0: the particle's mass at its last clock
-    reset, its injection mass if never reset.  It is a RECORDED
-    quantity, not a model input -- tau says how long ago the clock was
-    zeroed, m_reset says at what mass, and without both the event is
-    only half logged.  It would have to be carried through grow(),
-    delete_particle() (swap with last) and add_particle() exactly as
-    inj_time is, and exported as out["final_m_reset"].
-
-    Whether the omission matters is an EMPIRICAL question.  Run
-    'heavier' without it first and look at whether <m>(tau) is clean.
-    If it is not, m_reset is what lets an exponent be FITTED rather than
-    assumed, e.g. from the logarithmic derivative
-
-        dln m / dtau = -b / (tau* - tau),
-
-    which returns b and tau* together, or by scanning beta in
-    m_0^(1/beta) - m^(1/beta) and choosing the beta that minimises the
-    scatter.  Neither procedure presupposes a value.
-
-    Coagulation does not need it: injection there always stamps m_inj,
-    so u_0 is common to every tracer.
-
-[12] FRAGMENT SPLIT WIDTH  --  the one parameter that BIASES alpha.
+[11] FRAGMENT SPLIT WIDTH  --  the one parameter that BIASES alpha.
 
     xi is drawn uniformly on (0.5 - w, 0.5 + w) with w =
     frag_split_width, and the pieces are xi*m and (1-xi)*m.  w = 0.5 is
@@ -374,15 +385,28 @@ concluding that a number is physics:
          check the acceptance and the value of frag_min_ratio)
 
   alpha shifted, spectrum visibly combed
-        frag_split_width below ~0.25 .............................. [12]
+        frag_split_width below ~0.25 .............................. [11]
 
   alpha clean, plateau finder reports a tight 1-decade plateau on a
   CLOSED run that is nonetheless wrong
         snapshot placement 'events' ............................... [10]
 
-  isochrone as wide as the whole inertial range, median age equal to
-  maximum age
-        clocks never reset; the age class is a family .............. [7]
+  an age class as wide as the whole inertial range, whatever
+  frag_age_rule is set to (median age equal to maximum age under
+  'inherit')
+        expected: an age class is an ensemble, not a path.  Measure a
+        trajectory with tracers instead ............................. [7]
+
+  a generation histogram with everything in gen = 0
+        the population has not been ground yet, or the run is shorter
+        than one waiting time at m_inj.  With frag_min_ratio > 0 a body
+        at the top has few partners of comparable mass and the wait
+        there is most of the descent ......................... [7], [8]
+
+  <x> or Var(x) not linear in gen, through the origin
+        the splits are correlated, i.e. the multiplicative picture is
+        wrong -- or gen_max is clipping and the tail is folded into the
+        last bin.  Check gen_overflow before concluding physics ..... [7]
 
   alpha clean but b too low
         the growth-law fit window reaches down into the shelf near
@@ -639,6 +663,19 @@ def simulate(
                                 # there is no sink, so the gate is silently disarmed instead of
                                 # raising; only an explicitly passed value on a closed run is an
                                 # error (see the validation block below).
+    track_generations=True,     # [v4] see note [7].  Carry `gen` on every particle -- the
+                                # number of splits between it and the body that ENTERED --
+                                # and bin the live population by (gen, mass) at each
+                                # snapshot, exactly as the isochrones bin it by (age, mass).
+                                # This is what the tracer machinery of v2/v3 was for, done
+                                # on the whole population rather than on a few thousand
+                                # tagged paths: same quantity, four orders of magnitude more
+                                # of it, 16 MB at N = 4e6.
+    gen_max=64,                 # Highest generation resolved.  Everything above is counted
+                                # in `gen_overflow` and NOT binned, so a clipped tail is a
+                                # number rather than a spurious pile in the last bin.  A
+                                # body needs ~log(m_inj/m_sink)/|<ln xi>| splits to reach
+                                # the sink -- 28 over six decades at w = 1/2.
     age_rule="min",             # coagulation age inheritance: 'min'|'mass_weighted'|'heavier'
     # ---- misc ----
     weight=1.0,                 # CONSTANT weight per simulated particle (see notes [5ii], [9])
@@ -667,6 +704,8 @@ def simulate(
                          "'lighter' or 'both_new'")
     if age_rule not in ("min", "max", "mass_weighted", "heavier"):
         raise ValueError("age_rule must be 'min', 'max', 'mass_weighted' or 'heavier'")
+    if int(gen_max) < 1:
+        raise ValueError("gen_max must be >= 1")
     if not (0.0 <= frag_split_width <= 0.5):
         raise ValueError("frag_split_width is a half-width: 0 <= w <= 0.5 "
                          "(0.5 = uniform split, 0 = exact halving)")
@@ -724,29 +763,36 @@ def simulate(
     bin_of = np.empty(cap, dtype=np.int32)
     pos_in_bin = np.empty(cap, dtype=np.int32)
 
+    gen = np.zeros(cap, dtype=np.int32)             # splits since the ancestor entered
+    gen_time = np.zeros(cap, dtype=np.float64)      # when that ancestor entered
+
     mass[:N0] = m_init
     inj_time[:N0] = 0.0
+    gen[:N0] = 0                 # the IC is a body ENTERING the system
+    gen_time[:N0] = 0.0
     live = N0
 
     bins = [[] for _ in range(B)]                   # bin -> list of particle indices
 
     def ensure_capacity(need):
         """Grow all per-particle arrays together, keeping the live prefix."""
-        nonlocal mass, inj_time, bin_of, pos_in_bin
+        nonlocal mass, inj_time, gen, gen_time, bin_of, pos_in_bin
         if need <= mass.size:
             return
         new_cap = max(need, int(mass.size * 1.6) + 1)
-        for name in ("mass", "inj_time", "bin_of", "pos_in_bin"):
+        for name in ("mass", "inj_time", "gen", "gen_time", "bin_of", "pos_in_bin"):
             old = locals_ref[name]
             new = np.empty(new_cap, dtype=old.dtype)
             new[:live] = old[:live]
             locals_ref[name] = new
         mass = locals_ref["mass"]
         inj_time = locals_ref["inj_time"]
+        gen = locals_ref["gen"]
+        gen_time = locals_ref["gen_time"]
         bin_of = locals_ref["bin_of"]
         pos_in_bin = locals_ref["pos_in_bin"]
 
-    locals_ref = {"mass": mass, "inj_time": inj_time,
+    locals_ref = {"mass": mass, "inj_time": inj_time, "gen": gen, "gen_time": gen_time,
                   "bin_of": bin_of, "pos_in_bin": pos_in_bin}
 
     # ------------------------------------------------------------------
@@ -837,6 +883,8 @@ def simulate(
         if j != last:
             mass[j] = mass[last]
             inj_time[j] = inj_time[last]
+            gen[j] = gen[last]
+            gen_time[j] = gen_time[last]
             b_last = int(bin_of[last]); p_last = int(pos_in_bin[last])
             bins[b_last][p_last] = j
             bin_of[j] = b_last
@@ -850,13 +898,16 @@ def simulate(
         bin_remove(i); apply_delta(b_old, -1)
         bin_add(i, b_new); apply_delta(b_new, +1)
 
-    def add_particle(m, t_born):
-        """Append one particle; returns its index."""
+    def add_particle(m, t_born, g=0, t_anc=None):
+        """Append one particle; returns its index.  `g` is its generation and `t_anc` the
+        moment its ancestor entered -- both default to a newly ENTERED body."""
         nonlocal live
         ensure_capacity(live + 1)
         i = live
         mass[i] = m
         inj_time[i] = t_born
+        gen[i] = g
+        gen_time[i] = t_born if t_anc is None else t_anc
         b = mass_to_bin(m)
         bin_add(i, b)
         apply_delta(b, +1)
@@ -898,6 +949,34 @@ def simulate(
     rows = {k: [] for k in ("t", "events", "live", "N_phys", "m_mean", "m_max",
                             "m_min", "M_sys", "M_in", "M_out", "n_out", "weight", "dndm")}
 
+    # [v4] Generation histogram, gated exactly like the isochrones -- the same
+    # statement that the steady state is up.  gen_num and gen_tau_sum give <tau>(g)
+    # for free, which is the clock and therefore b.
+    use_gen = bool(track_generations)
+    G_MAX = int(gen_max)
+    gen_counts = np.zeros((G_MAX + 1, B), dtype=np.float64) if use_gen else None
+    gen_num = np.zeros(G_MAX + 1, dtype=np.float64) if use_gen else None
+    gen_tau_sum = np.zeros(G_MAX + 1, dtype=np.float64) if use_gen else None
+    gen_mass_sum = np.zeros((G_MAX + 1, B), dtype=np.float64) if use_gen else None
+    gen_overflow = 0.0
+    gen_snaps = 0
+    # [v4] TWO different times per generation, and they are not interchangeable.
+    #   gen_tau_live  -- mean age of the particles CURRENTLY at g, taken at snapshots.
+    #                    It saturates at the residence time of the box: after one
+    #                    turnover everything alive is young whatever its generation.
+    #   gen_tau_reach -- age AT THE MOMENT the particle reached g, accumulated at the
+    #                    event.  This is the "time to reach generation g", the direct
+    #                    analogue of the tracer's tau(k), and the one that carries b.
+    gen_reach_sum = np.zeros(G_MAX + 1, dtype=np.float64) if use_gen else None
+    gen_reach_n = np.zeros(G_MAX + 1, dtype=np.float64) if use_gen else None
+
+    def gen_reached(g, t_anc):
+        """A particle has just arrived at generation g; record how long that took."""
+        if use_gen and 0 <= g <= G_MAX and w * sink_events >= iso_start_sink \
+                and t_phys >= iso_t_start:
+            gen_reach_sum[g] += w * (t_phys - t_anc)
+            gen_reach_n[g] += w
+
     use_iso = iso_age_edges is not None
     if use_iso:
         iso_age_edges = np.asarray(iso_age_edges, dtype=float)
@@ -909,7 +988,7 @@ def simulate(
     iso_t_begin = np.nan       # physical time at which accumulation actually started
 
     def snapshot():
-        nonlocal iso_snaps, iso_t_begin
+        nonlocal iso_snaps, iso_t_begin, gen_snaps, gen_overflow
         N_phys = w * live
         rows["t"].append(t_phys)
         rows["events"].append(events)
@@ -929,6 +1008,19 @@ def simulate(
         # Two gates, both permissive by default.  iso_start_sink is the physical one:
         # it waits until the cascade has actually delivered mass to the sink, which is
         # the only N-independent statement of "the steady state is up".
+        if (use_gen and live > 0 and t_phys >= iso_t_start
+                and w * sink_events >= iso_start_sink):
+            _g = gen[:live]
+            _ok = _g <= G_MAX
+            gen_overflow += w * float(_g.size - _ok.sum())
+            _gg = _g[_ok].astype(np.int64)
+            _bb = bin_of[:live][_ok].astype(np.int64)
+            np.add.at(gen_counts, (_gg, _bb), w)
+            np.add.at(gen_mass_sum, (_gg, _bb), w * mass[:live][_ok])
+            np.add.at(gen_num, _gg, w)
+            np.add.at(gen_tau_sum, _gg, w * (t_phys - gen_time[:live][_ok]))
+            gen_snaps += 1
+
         if (use_iso and live > 0 and t_phys >= iso_t_start
                 and w * sink_events >= iso_start_sink):
             if iso_snaps == 0:
@@ -1001,7 +1093,7 @@ def simulate(
                 inj_residual -= k
                 ensure_capacity(live + k)
                 for _ in range(k):
-                    add_particle(float(injection_mass), t_phys)
+                    i_inj = add_particle(float(injection_mass), t_phys, 0, t_phys)
                 M_sys += w * k * injection_mass
                 M_in += w * k * injection_mass
                 if injection_mass > m_max:
@@ -1049,6 +1141,10 @@ def simulate(
         if process == "coagulation":
             mn = m1 + m2
             inj_time[i] = inherit_age(inj_time[i], inj_time[j], m1, m2)
+            # [v4] one split deeper than the deeper parent; inherits the OLDER ancestor
+            gen[i] = (gen[i] if gen[i] >= gen[j] else gen[j]) + 1
+            if gen_time[j] < gen_time[i]:
+                gen_time[i] = gen_time[j]
             mass[i] = mn
             move_bin(i, mass_to_bin(mn))
             delete_particle(j)
@@ -1094,7 +1190,15 @@ def simulate(
             inj_time[ip] = t_a          # <-- MUST be written now: the slot is REUSED and
                                         #     under v2 it was silently already correct.
             move_bin(ip, mass_to_bin(ma))
-            i_new = add_particle(mb, t_b)
+            # [v4] BOTH fragments go one generation deeper and keep the ancestor's
+            # clock, whatever frag_age_rule did to inj_time -- gen_time is a separate
+            # field precisely so the two cannot interfere.
+            _g1 = int(gen[ip]) + 1
+            _tanc = float(gen_time[ip])
+            gen[ip] = _g1
+            i_new = add_particle(mb, t_b, _g1, _tanc)
+            gen_reached(_g1, _tanc)      # both fragments arrived at the same time
+            gen_reached(_g1, _tanc)
             events += 1; tries_since_event = 0
             if ma < m_min: m_min = ma
             if mb < m_min: m_min = mb
@@ -1179,6 +1283,36 @@ def simulate(
                 % (t_phys, sink_events, iso_t_start, iso_start_sink),
                 RuntimeWarning, stacklevel=2)
 
+    # ---- generations -----------------------------------------------------------
+    if use_gen:
+        out["gen_counts"] = gen_counts
+        out["gen_dndm"] = gen_counts / widths[None, :] / max(gen_snaps, 1)
+        out["gen_mass"] = gen_mass_sum / max(gen_snaps, 1)
+        out["gen_num"] = gen_num
+        with np.errstate(invalid="ignore", divide="ignore"):
+            out["gen_tau_live"] = np.where(gen_num > 0, gen_tau_sum / gen_num, np.nan)
+            out["gen_tau"] = np.where(gen_reach_n > 0, gen_reach_sum / gen_reach_n, np.nan)
+        out["gen_reach_n"] = gen_reach_n
+        out["gen_snapshots"] = float(gen_snaps)
+        out["gen_overflow"] = float(gen_overflow)
+        out["gen_index"] = np.arange(G_MAX + 1, dtype=float)
+        out["final_gen"] = gen[:live].astype(float)
+        out["final_gen_time"] = gen_time[:live].copy()
+        if gen_snaps == 0:
+            warnings.warn(
+                "generations requested but NEVER accumulated: the run ended at t = %.3g "
+                "with %d sink absorptions, while the gate asks for t >= %.3g and >= %g "
+                "absorptions.  gen_counts is all zeros."
+                % (t_phys, sink_events, iso_t_start, iso_start_sink),
+                RuntimeWarning, stacklevel=2)
+        elif gen_overflow > 0:
+            warnings.warn(
+                "%.3g particle-snapshots had gen > gen_max = %d and were NOT binned "
+                "(%.2f%% of the total).  Raise gen_max, or read the histogram as "
+                "truncated." % (gen_overflow, G_MAX,
+                                100 * gen_overflow / max(gen_num.sum() + gen_overflow, 1.0)),
+                RuntimeWarning, stacklevel=2)
+
     out["meta"] = {
         "process": process,
         "system": system,
@@ -1193,6 +1327,8 @@ def simulate(
         "frag_split_width": float(frag_split_width),   
         "frag_age_rule": frag_age_rule,     
         "age_rule": age_rule,
+        "track_generations": bool(use_gen),
+        "gen_max": int(G_MAX),
         "weight": w,
         "volume": V,
         "clock": "dt = 2*V/(w*R), R over ordered pairs",
